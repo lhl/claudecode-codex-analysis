@@ -161,6 +161,82 @@ What to report:
 
 - Confirm the replacement is an exact, unambiguous match and is robust to user/system text containing the sentinel elsewhere.
 
+### 9. Token estimation uses blanket 4/3 multiplier hiding 10-30% errors
+
+Severity: medium (cost/quality)
+
+Evidence:
+
+- `src/services/compact/microCompact.ts:204` pads all token estimates by 4/3 "to be conservative since we're approximating."
+- The underlying `estimateMessageTokens()` counts text + thinking + tool_use block character lengths but applies uniform character-to-token density. Text is ~0.25-0.33 tokens/char for English, but tool schemas have highly variable compression and thinking block metadata overhead is not counted.
+- Additionally, `IMAGE_MAX_TOKEN_SIZE` is hardcoded at 2000 (`src/services/compact/microCompact.ts:38`), but actual image token costs range 500-4000+.
+- `contentSize()` in `src/utils/toolResultStorage.ts:518-529` only counts text block lengths, ignoring JSON structure overhead (~5% undercount).
+- `tokenCountWithEstimation` is called BEFORE `stripImagesFromMessages` / `stripReinjectedAttachments`, so the sent-to-API payload is smaller than estimated.
+
+Why it matters:
+
+- Autocompact threshold decisions based on these estimates can fire too early or too late.
+- Tool-heavy sessions and image-heavy sessions are the most affected.
+- Multiple estimation errors compound — the 4/3 pad doesn't consistently cover them.
+
+### 10. Streaming compaction fallback rate is 2.79% on model 4.6 (vs 0.01% on 4.5)
+
+Severity: medium (architecture/cost)
+
+Evidence:
+
+- `src/services/compact/prompt.ts:19-26` documents that the no-tools forked summarizer sometimes calls tools despite being told not to. With `maxTurns: 1`, one failed tool call = silent failure, triggering the streaming fallback.
+- The `NO_TOOLS_PREAMBLE` is repeated as both preamble AND trailer specifically because the 4.6 failure rate is 279× higher than 4.5.
+
+Why it matters:
+
+- The streaming fallback has tool access (FileReadTool, optionally ToolSearchTool and MCP tools), increasing injection surface and making compaction behavior nondeterministic.
+- ~3% of all compactions on model 4.6 go through this degraded path.
+
+What to report:
+
+- Consider enforcing tool-free compaction at the API layer rather than relying on prompt instructions.
+
+### 11. GrowthBook can return null/NaN/string values that bypass default checks
+
+Severity: medium (reliability)
+
+Evidence:
+
+- `src/utils/toolResultStorage.ts:65-77` includes defensive checks: "GrowthBook's cache returns `cached !== undefined ? cached : default`, so a flag served as `null` leaks through."
+- The code uses optional chaining and `typeof` checks throughout. Similar guards appear in multiple files.
+
+Why it matters:
+
+- GrowthBook has historically shipped corrupted configs. Any code path that trusts GrowthBook values without explicit null/type guards gets wrong behavior silently.
+- This is not a Claude Code bug per se, but it means feature-gate values throughout the system are fragile.
+
+### 12. Cache break detection ignores drops under 2,000 tokens
+
+Severity: low-medium
+
+Evidence:
+
+- `src/services/api/promptCacheBreakDetection.ts:117-120` defines `MIN_CACHE_MISS_TOKENS = 2_000`: "Small drops (e.g., a few thousand tokens) can happen due to normal variation and aren't worth alerting on."
+
+Why it matters:
+
+- In a 50K-token session, a 2K drop is 4% of context silently undetected.
+- Repeated small drops can compound without triggering any diagnostics.
+
+### 13. Cached microcompact state can be polluted by subagents
+
+Severity: medium
+
+Evidence:
+
+- `src/services/compact/microCompact.ts:271-276`: "Only run cached MC for the main thread to prevent forked agents (session_memory, prompt_suggestion, etc.) from registering their tool_results in the global cachedMCState, which would cause the main thread to try deleting tools that don't exist in its own conversation."
+
+Why it matters:
+
+- If the guard (checking querySource for main thread) is bypassed or refactored incorrectly, `cache_edits` will reference `tool_use_id`s that don't exist in the main thread's transcript, causing unpredictable cache behavior.
+- The guard is a string comparison that has already been wrong once (the output-style latent bug).
+
 ## Historical/likely-fixed issues documented in comments
 
 These may already be fixed, but they are worth knowing because they show where the system has broken before.
@@ -182,6 +258,18 @@ Evidence:
 Evidence:
 
 - `src/main.tsx` contains a long comment explaining why GrowthBook initialization must be awaited for ant model aliases such as `capybara-fast`, otherwise unresolved aliases could 404 and crashloop on fresh pods.
+
+### Autocompact had no circuit breaker, allowing 3,272 consecutive failures per session
+
+Evidence:
+
+- `src/services/compact/autoCompact.ts:257-260` adds `MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3` with a comment referencing BQ data from 2026-03-10: 1,279 sessions had 50+ consecutive compaction failures (up to 3,272 in a single session), wasting ~250K API calls/day globally.
+
+### Circular import in compaction caused CI race condition
+
+Evidence:
+
+- `src/services/compact/grouping.ts:18-21` was extracted to break a `compact.ts ↔ compactMessages.ts` cycle (CC-1180). The comment says: "the cycle shifted module-init order enough to surface a latent ws CJS/ESM resolution race in CI shard-2."
 
 ## Non-issues or analysis limitations
 
