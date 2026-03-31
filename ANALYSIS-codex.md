@@ -466,6 +466,22 @@ See `codex/codex-rs/features/src/lib.rs:553-562`, `codex/codex-rs/features/src/l
 
 The main thing to notice is not any single flag; it is how much of the product is feature-driven. The repo is set up to ship a stable core while continuously incubating new collaboration, memory, artifact, and interaction layers.
 
+## Gotchas: remote control and ambient authority (or lack thereof)
+
+Worth noting explicitly what Codex does *not* have, because the contrast with Claude Code is significant.
+
+**No remote killswitch.** Codex has no mechanism for OpenAI to remotely terminate, downgrade, or modify the behavior of running client installations. Feature flags are compiled into the binary and configured locally via `config.toml` (`codex/codex-rs/features/src/lib.rs:521-855`). There is no GrowthBook/Statsig-style remote feature gating of security-critical decisions.
+
+**No remote session mirroring.** Codex has no equivalent of Claude Code's `tengu_ccr_mirror` gate, which can cause local sessions to spawn outbound mirrors to remote infrastructure.
+
+**No dynamic remote command blocklist.** Codex's command-safety analysis is a local typed system. There is no remote gate that can change which commands the agent is allowed to run.
+
+**Statsig is telemetry-only.** Codex uses Statsig as a metrics exporter endpoint (`https://ab.chatgpt.com/otlp/v1/metrics` at `codex/codex-rs/otel/src/config.rs:6-8`), with a hardcoded API key. It does not use Statsig for feature control.
+
+**The one remote content fetch** is `announcement_tip.toml` from GitHub raw (`codex/codex-rs/tui/src/tooltips.rs:6-209`), which is purely informational UI copy (promotional messages like "2x rate limits until April 2nd"). It doesn't affect runtime behavior.
+
+The tradeoff is real in both directions. Codex can't be remotely emergency-braked if a security issue is discovered — OpenAI would need users to update their local binary. Claude Code can respond to incidents faster, at the cost of a remote trust dependency on Statsig/GrowthBook account security. Notably, Claude Code's remote gating covers not just direct Anthropic API users but also enterprise proxy deployments routing through custom `ANTHROPIC_BASE_URL` endpoints — the `apiBaseUrlHost` attribute was added specifically to target those. Only explicit Bedrock/Vertex/Foundry deployments are exempt. Both positions are defensible; neither is free.
+
 ## Quirks, hidden knobs, and product oddities
 
 - There is an explicit approvals+sandbox bypass flag, `--dangerously-bypass-approvals-and-sandbox` (alias `--yolo`), and it also disables the "must be inside a git repo" guardrail (`codex/codex-rs/exec/src/cli.rs:51-68`, `codex/codex-rs/tui/src/cli.rs:87-99`, `codex/codex-rs/exec/src/lib.rs:517-525`).

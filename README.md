@@ -40,40 +40,44 @@ None of this changes the technical findings. But it's an unusual provenance to r
 
 ## Comparison: Claude Code vs Codex
 
-Having gone through both codebases in detail, here's the honest take.
+### Architecture
 
-### Engineering maturity
+Codex is a clean Rust state machine. `ToolRouter`, `ToolOrchestrator`, `ContextManager`, `AgentControl` — each component has one job, the type system enforces boundaries, and there's very little accumulated debt. It's a young codebase and it shows, in the good way.
 
-Codex reads like a system designed by people who knew exactly what they were building before they started. The Rust core is a genuine typed state machine — `ToolRouter`, `ToolOrchestrator`, `ContextManager`, `AgentControl` — where each component has a clear responsibility and the type system enforces boundaries. The codebase is young, relatively small, and shows very few signs of accumulated technical debt.
-
-Claude Code reads like a system that has been through a war. It works — impressively well, at scale — but the architecture bears the scars of rapid iteration under production pressure. Six overlapping compaction layers. A 2000-line `readOnlyValidation.ts` that has accreted individual exploit defenses like geological strata. Feature gates numbered in the dozens. Inline constants duplicated to break circular imports. A circuit breaker added after discovering 250K wasted API calls per day. This is not bad engineering — it's engineering that has survived contact with millions of users and the reality of shipping weekly.
+Claude Code is a large TypeScript system that has clearly been shipping under pressure for a long time. Six overlapping compaction layers. A 2000-line `readOnlyValidation.ts` that has accreted individual exploit defenses like geological strata. 52+ feature gates. Inline constants duplicated to break circular imports. A circuit breaker added after someone found 250K wasted API calls per day in the BQ data. The architecture works, but you can read the history of production incidents in the shape of the code.
 
 ### Compaction
 
-The starkest difference. Claude Code has six compaction layers (snip, microcompact, cached microcompact, session-memory compact, full LLM summarization, context collapse) with complex interactions, a 2.79% streaming fallback rate on model 4.6 that gives the summarizer tool access, and post-compact rehydration that can undo a large fraction of the savings. Codex delegates compaction to a single `/responses/compact` backend endpoint and moves on. Codex's approach is simpler and probably more correct; Claude Code's approach handles more edge cases but at a complexity cost that is clearly causing real bugs.
+The starkest difference. Claude Code has six compaction layers (snip, microcompact, cached microcompact, session-memory compact, full LLM summarization, context collapse), a 2.79% streaming fallback rate on model 4.6 that hands the summarizer tool access it shouldn't have, and post-compact rehydration that can undo a large fraction of the savings. Codex delegates compaction to `/responses/compact` and moves on. It's not even close — Codex's approach is simpler and almost certainly more correct, though Claude Code's handles edge cases that Codex hasn't encountered yet.
 
 ### Security
 
-Both take security seriously, but the philosophies diverge. Claude Code's security is reactive and defense-in-depth: specific exploit defenses (GNU getopt attacks, variable expansion injection, `tree -R` file writes, compound `cd`+`git` sandbox escapes), a nonce-based hijack guard, a `bypassPermissions` killswitch, and a massive validation layer that has clearly been shaped by real attack reports. Codex's security is structural: typed composable command-safety analysis, PowerShell AST parsing on Windows, a clean sandbox model with explicit per-command safe-flag declarations. Claude Code has seen more attacks and defended against them; Codex has a cleaner foundation that hasn't been tested as hard yet.
+Different philosophies. Claude Code's security is reactive and layered: GNU getopt attacks, variable expansion injection, `tree -R` file writes, compound `cd`+`git` sandbox escapes, a nonce-based hijack guard, a `bypassPermissions` killswitch — a massive validation layer clearly shaped by real attack reports and HackerOne submissions. Codex's security is structural: typed composable command-safety analysis, PowerShell AST parsing on Windows, explicit per-command safe-flag declarations. Claude Code knows what actual attackers try. Codex has a cleaner model that hasn't been hit as hard yet.
 
 ### Memory
 
-Both use the same basic pattern: extract insights from prior sessions, consolidate in the background. Claude Code is more ambitious — daily logs, a "dream" consolidation step, per-agent memory scopes — but that ambition adds complexity and the ERRATA shows real bugs in the resume/cache interaction. Codex is cleaner: two phases, a locked-down sub-agent for consolidation, explicit race documentation. Codex's memory system is more likely to be correct; Claude Code's is more likely to be useful.
+Same basic pattern (extract from prior sessions, consolidate in background), different execution. Claude Code is more ambitious — daily logs, a "dream" consolidation step, per-agent scopes — but the ERRATA shows real bugs in resume/cache interaction. Codex has two phases, a locked-down sub-agent, and explicit race documentation. The Codex system is probably more correct; the Claude Code system tries to do more interesting things with the information.
 
 ### Model steering
 
-This is where Claude Code gets genuinely fascinating. The `@[MODEL LAUNCH]` gates with specific false-claims rates (Capybara v8: 29-30%), the dynamic boundary markers, the dead-code-elimination for ant-internal paths, the tick-based proactive mode, the verification accountability model — this is a system that has been tuned against specific measured failure modes of specific models. Codex has a personality system and collaboration modes, which are nice product features, but they don't show the same depth of model-behavioral understanding.
+This is where Claude Code gets genuinely interesting. `@[MODEL LAUNCH]` gates with specific false-claims rates (Capybara v8: 29-30% vs v4's 16.7%), dynamic boundary markers, DCE for ant-internal paths, tick-based proactive mode, a verification accountability model — this is a system tuned against specific measured failure modes of specific models. It's less "prompt engineering" and more "behavioral countermeasures informed by telemetry." Codex has a personality system and collaboration modes, which are nice but not operating at the same depth of model-behavioral understanding.
 
 ### Telemetry
 
-Claude Code runs dual-sink telemetry (Datadog + first-party) with PII-tagged column routing. Codex uses Sentry + OTEL. Both are standard for their scale. Claude Code's is more sophisticated; Codex's is more conventional. Neither is doing anything unusual for a production SaaS tool.
+Claude Code dual-sinks to Datadog and a first-party pipeline with PII-tagged column routing. Codex uses Sentry + OTEL. Neither is unusual for their scale. Claude Code's is more elaborate; Codex's is more standard.
 
-### What each should steal from the other
+### Remote control
 
-**Claude Code should steal from Codex:** The typed state-machine architecture. The clean compaction delegation. The composable command-safety analysis. The philosophy of letting the type system enforce boundaries instead of relying on runtime validation accreted over time.
+The sharpest trust-model difference. Claude Code has a remote killswitch: Anthropic can force-terminate or force-downgrade any first-party API installation via a Statsig/GrowthBook gate (`tengu_disable_bypass_permissions_mode`). There's also a session mirroring gate (`tengu_ccr_mirror`) that can cause local sessions to spawn outbound mirrors, and a dynamic bash blocklist gate (`tengu_sandbox_disabled_commands`) that can remotely change which commands the agent is allowed to run. Only explicit Bedrock, Vertex, and Foundry deployments are exempt (GrowthBook is disabled for those). Enterprise proxy deployments routing through a custom `ANTHROPIC_BASE_URL` are still subject to GrowthBook gating — and individually targetable via the `apiBaseUrlHost` attribute, which was added specifically for that purpose.
 
-**Codex should steal from Claude Code:** The depth of model-steering knowledge. The specific exploit defenses (many of which apply to any LLM-driven shell tool). The session-memory architecture's ambition, even if the implementation needs cleaning. The hard-won lessons encoded in circuit breakers and fallback paths.
+Importantly, this is not a blunt global switch. GrowthBook is initialized with per-user attributes — org UUID, account UUID, email, device ID, subscription type, rate limit tier, platform, app version, and even the hostname of enterprise proxy deployments. Anthropic can target the killswitch at a specific organization, a specific user, all free-tier users, a single device, or any boolean combination. The user-facing notification says "disabled by your organization policy" even when it's Anthropic flipping the gate. This is qualitatively different from shutting off API access: API shutdown is binary and visible; the killswitch is granular, silent, and framed as org policy.
 
-### Bottom line
+Codex has none of this. Feature flags are local, Statsig is used only for metrics export, and there's no mechanism for OpenAI to reach into running installations. The tradeoff: Codex can't be remotely emergency-braked if a security issue is discovered; Claude Code can respond to incidents faster at the cost of a remote trust dependency on a third-party feature-flagging service.
 
-Codex is the codebase you'd want to inherit. Claude Code is the codebase that has actually survived. The gap between them is not talent or intent — it's the difference between a system designed from scratch with hindsight and a system that has been keeping the lights on while being rewritten in flight. Give Codex two years of production pressure and it will either maintain its architectural discipline (impressive) or start accumulating the same kind of scar tissue Claude Code carries (normal). The interesting question is whether Codex's Rust type system and cleaner foundation give it enough structural advantage to resist the entropy that Claude Code's TypeScript flexibility made inevitable.
+### Cross-pollination
+
+Claude Code could use Codex's typed state-machine approach, clean compaction delegation, and composable command-safety analysis — more structure enforced at the type level rather than accreted at runtime. Codex could use Claude Code's model-steering depth, its specific exploit defenses (most of which apply to any LLM-driven shell tool), and the ambition of its session-memory system.
+
+### Overall
+
+These are recognizably the same kind of system — LLM-powered coding agents with shell access, sandboxing, memory, and compaction — built by teams that made very different tradeoffs. Codex optimized for architectural clarity from a clean start in Rust. Claude Code optimized for shipping features fast in TypeScript and fixing what broke. The interesting question is convergence: does Codex accumulate the same complexity under production load, or does the Rust type system provide enough structural resistance to keep the architecture clean as the feature set grows? Two years from now either answer would be interesting.

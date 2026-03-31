@@ -2,6 +2,63 @@
 
 This file is intentionally narrower than the main analysis docs (`ANALYSIS-claudecode.md`, `ANALYSIS-codex.md`). These are the issues that look most worth reporting or following up on.
 
+## Remote control surface
+
+These are not bugs in the traditional sense, but they are architectural properties that users should be aware of.
+
+### Remote permission killswitch and process termination
+
+Anthropic can remotely force-downgrade or terminate any Claude Code installation using first-party Anthropic API via the Statsig/GrowthBook gate `tengu_disable_bypass_permissions_mode`.
+
+Evidence:
+
+- `src/utils/permissions/bypassPermissionsKillswitch.ts:19-47` checks the gate once before the first query. If the gate is on, it downgrades from `bypassPermissions` mode to `default`.
+- `src/utils/permissions/permissionSetup.ts:1411-1431` (`checkAndDisableBypassPermissions()`) does the same check and then calls `gracefulShutdown(1, 'bypass_permissions_disabled')` — force-terminating the process.
+- Auto mode has the same pattern via `tengu_auto_mode_config` — a remote circuit breaker that can kick users out of auto mode mid-session.
+- These gates affect all users except those explicitly using Bedrock, Vertex, or Foundry (where GrowthBook is disabled via `isAnalyticsDisabled()` in `src/services/analytics/config.ts`). Enterprise proxy deployments that use a custom `ANTHROPIC_BASE_URL` but do not set those provider env vars are still subject to GrowthBook gating — and are individually targetable via the `apiBaseUrlHost` attribute (see below).
+
+Targeting granularity:
+
+The killswitch is not just a global on/off. GrowthBook is initialized with rich user attributes (`src/services/analytics/growthbook.ts:32-47`, `src/services/analytics/growthbook.ts:454-485`) that allow targeting at any combination of:
+
+- `organizationUUID` — per-org
+- `accountUUID` — per-user
+- `email` — per-user
+- `deviceID` — per-device
+- `sessionId` — per-session
+- `subscriptionType` — by plan tier (free, pro, enterprise)
+- `rateLimitTier` — by rate limit tier
+- `userType` — `ant` (internal) vs external
+- `platform` — win32/darwin/linux
+- `apiBaseUrlHost` — per enterprise proxy deployment
+- `appVersion` — per Claude Code version
+
+The `apiBaseUrlHost` attribute is particularly notable: comments at `src/services/analytics/growthbook.ts:428-434` explain it was added specifically because enterprise proxy deployments (Epic, Marble, etc.) lack `organizationUUID`/`accountUUID`/`email`, so this gives Anthropic a stable targeting attribute for specific enterprise customers even when those customers don't use Anthropic's OAuth.
+
+This makes the killswitch qualitatively different from "shut off API access." Shutting off the API is binary and visible. The killswitch can silently downgrade specific permission modes for a specific org, a specific user, a specific plan tier, or a specific enterprise proxy deployment — without affecting anyone else, and without the targeted user necessarily understanding why their permissions changed. The notification says "Bypass permissions mode was disabled by your organization policy" — framing a remote Anthropic action as an org policy decision.
+
+Why it matters:
+
+- The trust model for first-party API users is: trust Anthropic's Statsig/GrowthBook account security. A compromise of that account could remotely terminate or downgrade every first-party Claude Code installation globally, or target specific organizations or users.
+- The gates are one-directional — they can only restrict permissions, never grant them. This is meaningfully different from a general remote-code-execution backdoor.
+- The emergency-response intent is reasonable. The granularity of targeting and the misleading notification framing are worth scrutiny.
+
+### Remote session mirroring
+
+The `tengu_ccr_mirror` GrowthBook gate, when enabled, causes every local session to spawn an outbound-only mirror session.
+
+Evidence:
+
+- `src/bridge/bridgeEnabled.ts:197-202`: `isCcrMirrorEnabled()` checks the `CCR_MIRROR` build flag, the `CLAUDE_CODE_CCR_MIRROR` env var, and the `tengu_ccr_mirror` GrowthBook gate.
+- `src/main.tsx:2918-2924`: when the gate is on and full remote control is not active, mirror mode is enabled.
+- `src/bridge/remoteBridgeCore.ts:748-752`: the mirror spawns an outbound-only Remote Control session with credential-based expiration.
+
+Why it matters:
+
+- When active, this forwards local session events to Anthropic's remote infrastructure. The mechanism exists for the Remote Control feature (legitimate product use), but the GrowthBook gate means Anthropic could enable it server-side without explicit per-session user action.
+- Like the killswitch, this affects all users except explicit Bedrock/Vertex/Foundry deployments. Enterprise proxy users are included.
+- The `CCR_MIRROR` build feature flag must also be enabled in the binary, so it's gated at both build time and runtime.
+
 ## Likely current/reportable issues
 
 ### 1. Published artifact appears to embed recoverable source via inline sourcemaps

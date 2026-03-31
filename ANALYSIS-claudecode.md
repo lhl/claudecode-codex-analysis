@@ -899,6 +899,46 @@ These aren’t the “main architecture”, but they’re the kind of glue that 
 - They have an explicit guard to prevent config writes from wiping auth state if the config file is truncated/corrupted mid-write, and it references a real GitHub issue (#3117) (`src/utils/config.ts:776-865`).
 - The external build ships 18 hard-disabled hidden command stubs of the form `export default { isEnabled: () => false, isHidden: true, name: 'stub' };` — likely placeholders for internal-only commands: `ant-trace`, `autofix-pr`, `backfill-sessions`, `break-cache`, `bughunter`, `ctx_viz`, `debug-tool-call`, `env`, `good-claude`, `issue`, `mock-limits`, `oauth-refresh`, `onboarding`, `perf-issue`, `reset-limits`, `share`, `summary`, `teleport` (`src/commands/ant-trace/index.js:1`, `src/commands/autofix-pr/index.js:1`, `src/commands/backfill-sessions/index.js:1`, `src/commands/break-cache/index.js:1`, `src/commands/bughunter/index.js:1`, `src/commands/ctx_viz/index.js:1`, `src/commands/debug-tool-call/index.js:1`, `src/commands/env/index.js:1`, `src/commands/good-claude/index.js:1`, `src/commands/issue/index.js:1`, `src/commands/mock-limits/index.js:1`, `src/commands/oauth-refresh/index.js:1`, `src/commands/onboarding/index.js:1`, `src/commands/perf-issue/index.js:1`, `src/commands/reset-limits/index.js:1`, `src/commands/share/index.js:1`, `src/commands/summary/index.js:1`, `src/commands/teleport/index.js:1`).
 
+## Gotchas: remote control and ambient authority
+
+These are architectural properties that don't fit neatly into "bugs" or "quirks" — they're deliberate design choices with implications that may surprise users.
+
+### Remote permission killswitch
+
+Anthropic can remotely force-downgrade or force-terminate Claude Code installations via the Statsig/GrowthBook gate `tengu_disable_bypass_permissions_mode`. The killswitch file (`src/utils/permissions/bypassPermissionsKillswitch.ts`) checks the gate once before the first query and downgrades `bypassPermissions` to `default`. A second path (`src/utils/permissions/permissionSetup.ts:1411-1431`) does the same check and then calls `gracefulShutdown(1, 'bypass_permissions_disabled')` — terminating the process entirely.
+
+Auto mode has the same pattern: `tengu_auto_mode_config` is a remote circuit breaker that can eject users from auto mode mid-session.
+
+The gates are one-directional — they can only restrict, never grant permissions. This is an emergency brake, not a backdoor.
+
+**Targeting granularity**: This is not a global on/off switch. GrowthBook is initialized with rich user attributes (`src/services/analytics/growthbook.ts:32-47`, `src/services/analytics/growthbook.ts:454-485`): `organizationUUID`, `accountUUID`, `email`, `deviceID`, `sessionId`, `subscriptionType`, `rateLimitTier`, `userType` (ant vs external), `platform`, `apiBaseUrlHost`, and `appVersion`. GrowthBook's standard targeting engine supports arbitrary boolean combinations, so Anthropic can target the killswitch at a specific org, a specific user, all free-tier users, a single device, a specific enterprise proxy deployment, or any combination.
+
+The `apiBaseUrlHost` attribute is worth noting: comments (`src/services/analytics/growthbook.ts:428-434`) explain it was added specifically because enterprise proxy deployments (Epic, Marble, etc.) lack org/account/email attributes, so this gives Anthropic a targeting handle on enterprise customers even when those customers don't use Anthropic's OAuth.
+
+This is qualitatively different from shutting off API access. API shutdown is binary and visible. The killswitch can silently downgrade specific permission modes for a specific org, user, plan tier, or enterprise deployment without affecting anyone else. The user notification says "Bypass permissions mode was disabled by your organization policy" (`src/utils/permissions/permissionSetup.ts:783-784`) — framing a remote Anthropic action as an org policy decision.
+
+**Scope**: Everyone except explicit Bedrock/Vertex/Foundry deployments (where GrowthBook is disabled via `isAnalyticsDisabled()` in `src/services/analytics/config.ts`). This notably includes enterprise proxy deployments that route through a custom `ANTHROPIC_BASE_URL` — they don't set the provider env vars, so GrowthBook remains active. The `apiBaseUrlHost` attribute exists specifically to make these deployments individually targetable. Only users who set `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, or `CLAUDE_CODE_USE_FOUNDRY` are fully exempt — which also means they can't be remotely emergency-braked if something goes wrong.
+
+### Remote session mirroring
+
+The `tengu_ccr_mirror` gate (`src/bridge/bridgeEnabled.ts:197-202`), when enabled, causes every local session to spawn an outbound-only mirror session to Anthropic's remote infrastructure (`src/bridge/remoteBridgeCore.ts:748-752`). This is the infrastructure behind the Remote Control product feature, but the GrowthBook gate means Anthropic could enable it server-side for first-party users without explicit per-session user action. It's gated at both build time (`CCR_MIRROR` feature flag) and runtime.
+
+### Dynamic bash blocklist
+
+`tengu_sandbox_disabled_commands` is a GrowthBook gate that controls a dynamic blocklist of bash commands. Unlike the killswitch (which only restricts permission modes), this directly changes which commands the agent can execute. The gate allows Anthropic to remotely block specific commands across all first-party installations — useful for incident response if a new exploit pattern is discovered, but another remote behavior-modification surface.
+
+### What Codex does differently
+
+Codex has no equivalent remote control surface. Its feature flags are compiled into the client and configured locally via `config.toml`. Statsig integration in Codex is used only for metrics/telemetry export (`https://ab.chatgpt.com/otlp/v1/metrics`), not feature gating. The only remote content Codex fetches is a promotional announcement tip from GitHub raw (`announcement_tip.toml`), which is purely informational UI copy.
+
+This is a genuine architectural difference. Codex trusts the locally-installed binary; Claude Code trusts a remote feature-flagging service for security-critical runtime decisions. Both are defensible positions with different tradeoff profiles.
+
+### The broader framing
+
+Of course, both tools depend on their respective companies continuing to serve the underlying models — you can't use Claude Code if Anthropic stops serving Claude, and you can't use Codex if OpenAI stops serving GPT. The killswitch is a different kind of dependency: it's not "the service is unavailable," it's "the service can reach into your running client and change what it's allowed to do." The distinction matters for anyone thinking about trust boundaries in agentic tooling.
+
+## Quirks, easter eggs, and cultural artifacts
+
 ### "The rules of thinking" wizard comment
 
 `src/query.ts:151-163` frames API thinking-block constraints in medieval fantasy:
