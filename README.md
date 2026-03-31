@@ -7,7 +7,6 @@ Initial analysis was performed with GPT-5.4 xhigh in Codex for both codebases. S
 ## Files
 
 ```
-ANALYSIS.md              — Entry point (links to both analyses)
 ANALYSIS-claudecode.md   — Full Claude Code source analysis (architecture, memory,
                            compaction, telemetry, hidden features, etc.)
 ANALYSIS-codex.md        — Full Codex source analysis (Rust core, sandboxing,

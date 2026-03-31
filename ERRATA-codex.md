@@ -15,7 +15,21 @@ Why it matters:
 - This is a privacy/security footgun for anyone who assumes prompts are ephemeral.
 - The code is already aware of the risk, but the mitigation is not implemented.
 
-## 2. Remote compaction requests appear to skip `prompt_cache_key`
+## 2. `/feedback` connectivity diagnostics include raw proxy/base-url env var values (no redaction)
+
+`FeedbackDiagnostics` collects proxy environment variables and `OPENAI_BASE_URL`, then includes them verbatim in the consent UI and the uploaded `codex-connectivity-diagnostics.txt` attachment when logs are enabled.
+
+- Env var capture and attachment text: `codex/codex-rs/feedback/src/feedback_diagnostics.rs:3-77`
+- Tests demonstrate credential-shaped values are preserved verbatim (for example, `https://user:password@...`): `codex/codex-rs/feedback/src/feedback_diagnostics.rs:111-145`
+- Consent UI renders the details and lists the attachment: `codex/codex-rs/tui/src/bottom_pane/feedback_view.rs:500-571`
+- Upload path attaches the diagnostics file when `include_logs = true`: `codex/codex-rs/feedback/src/lib.rs:176-214`, `codex/codex-rs/feedback/src/lib.rs:245-340`
+
+Why it matters:
+
+- Real-world proxy env vars often embed credentials or tokens in the URL; this behavior can leak them into feedback uploads.
+- Even with consent, "verbatim env var dump" is a sharp edge. At minimum it should redact URL userinfo and common query-token shapes.
+
+## 3. Remote compaction requests appear to skip `prompt_cache_key`
 
 Normal Responses requests include `prompt_cache_key = conversation_id`, but the compaction request type does not expose that field and the remote compaction payload omits it.
 
@@ -28,7 +42,7 @@ Why it matters:
 - Likely cost/latency regression on a hot path.
 - Especially relevant because OpenAI-provider compaction defaults to the remote endpoint (`codex/codex-rs/core/src/codex.rs:6215-6235`).
 
-## 3. `apply_patch` safety for `UnlessTrusted` has a self-identified likely logic bug
+## 4. `apply_patch` safety for `UnlessTrusted` has a self-identified likely logic bug
 
 `assess_patch_safety()` immediately asks the user under `AskForApproval::UnlessTrusted`, but the inline TODO says this is probably wrong and that writable-path checks should happen first.
 
@@ -40,7 +54,7 @@ Why it matters:
 - This can cause unnecessary prompts and inconsistent approval behavior.
 - The code itself already flags the issue.
 
-## 4. Remote plugin sync currently conflates "disabled" with "uninstalled"
+## 5. Remote plugin sync currently conflates "disabled" with "uninstalled"
 
 The plugin manager explicitly notes that remote `enabled = false` is currently treated as uninstall rather than a distinct disabled state.
 
@@ -51,7 +65,7 @@ Why it matters:
 - This is a real state-model mismatch.
 - Install state and enable state should not collapse into one bit.
 
-## 5. Analytics queue drops events under backpressure and records no metric for the drop
+## 6. Analytics queue drops events under backpressure and records no metric for the drop
 
 The analytics queue is bounded. When it fills, events are dropped and only a warning is logged; the TODO says there is no metric yet.
 
@@ -62,7 +76,7 @@ Why it matters:
 - Silent-ish observability blind spot.
 - If analytics reliability matters, this makes overload analysis harder.
 
-## 6. Built-in `explorer` role is advertised as specialized, but its config file is empty
+## 7. Built-in `explorer` role is advertised as specialized, but its config file is empty
 
 The built-in role registry exposes `explorer` as a special codebase-question role and points it at `explorer.toml`, but the referenced file is empty in this checkout.
 
@@ -75,7 +89,7 @@ Why it matters:
 - The surface presentation suggests stronger specialization than the runtime actually enforces.
 - This is probably not a correctness bug, but it is product/implementation drift.
 
-## 7. Unix dangerous-command detection is much narrower than the product surface implies
+## 8. Unix dangerous-command detection is much narrower than the product surface implies
 
 On Unix, the dangerous-command heuristic boils down to `rm -f`, `rm -rf`, and recursive `sudo`, plus those commands when embedded in plain `bash -lc` scripts.
 
@@ -87,7 +101,7 @@ Why it matters:
 - Broader destructive protection must come from sandboxing, approval policy, exec policy, and guardian review, not from this heuristic.
 - That may be intentional, but it is still a gap worth documenting clearly.
 
-## 8. Memory phase-2 handler documents a race around agent-status subscription
+## 9. Memory phase-2 handler documents a race around agent-status subscription
 
 The phase-2 consolidation agent handler includes a TODO noting "we might have a very small race here" around subscribing to status after spawn.
 
@@ -98,7 +112,7 @@ Why it matters:
 - Probably low severity.
 - Still worth fixing in a subsystem that is supposed to serialize and safely maintain global memory state.
 
-## 9. `request_permissions` still bypasses guardian auto-review
+## 10. `request_permissions` still bypasses guardian auto-review
 
 There is an explicit TODO noting that guardian auto-review does not yet cover `request_permissions` / `with_additional_permissions`; those still route through the manual event path.
 
@@ -108,6 +122,17 @@ Why it matters:
 
 - This creates an inconsistent approval story between normal exec approvals and permission-upgrade requests.
 - It is more of a missing feature than a bug, but it is exactly the sort of security-surface inconsistency that tends to matter later.
+
+## 11. `codex app` DMG installer path does not do integrity verification client-side
+
+On macOS, `codex app` will `curl` a DMG, mount it via `hdiutil`, and copy `Codex.app` via `ditto`. The download URL is configurable via a flag.
+
+- Default DMG URL: `codex/codex-rs/cli/src/app_cmd.rs:4-15`
+- Download and install logic: `codex/codex-rs/cli/src/desktop_app/mac.rs:1-237`
+
+Why it matters:
+
+- This is user-initiated, but it is still a supply-chain surface: there is no hash/signature verification in the client itself (beyond whatever macOS enforces when launching).
 
 ## Summary
 

@@ -297,6 +297,7 @@ The feedback system is not just "send a thumbs down." It:
 - captures full trace logs into a 4 MiB ring buffer (`codex/codex-rs/feedback/src/lib.rs:28-34`, `codex/codex-rs/feedback/src/lib.rs:63-94`, `codex/codex-rs/feedback/src/lib.rs:161-205`);
 - collects structured feedback tags (`codex/codex-rs/feedback/src/lib.rs:82-94`, `codex/codex-rs/feedback/src/lib.rs:96-113`);
 - can upload `bug`, `bad_result`, `good_result`, and `safety_check` reports plus attachments to Sentry (`codex/codex-rs/feedback/src/lib.rs:245-340`).
+- can attach and UI-render connectivity diagnostics derived from proxy env vars and `OPENAI_BASE_URL`, verbatim, as `codex-connectivity-diagnostics.txt` (`codex/codex-rs/feedback/src/feedback_diagnostics.rs:3-66`, `codex/codex-rs/tui/src/bottom_pane/feedback_view.rs:500-571`).
 
 ### What I did not find
 
@@ -377,6 +378,20 @@ Notable default-disabled but interesting features:
 See `codex/codex-rs/features/src/lib.rs:553-562`, `codex/codex-rs/features/src/lib.rs:618-623`, `codex/codex-rs/features/src/lib.rs:726-783`, `codex/codex-rs/features/src/lib.rs:802-843`.
 
 The main thing to notice is not any single flag; it is how much of the product is feature-driven. The repo is set up to ship a stable core while continuously incubating new collaboration, memory, artifact, and interaction layers.
+
+## Quirks, hidden knobs, and product oddities
+
+- There is an explicit approvals+sandbox bypass flag, `--dangerously-bypass-approvals-and-sandbox` (alias `--yolo`), and it also disables the "must be inside a git repo" guardrail (`codex/codex-rs/exec/src/cli.rs:51-68`, `codex/codex-rs/tui/src/cli.rs:87-99`, `codex/codex-rs/exec/src/lib.rs:517-525`).
+- The CLI has multiple intentionally hidden/internal subcommands (`execpolicy`, `responses-api-proxy`, `stdio-to-uds`, and `debug clear-memories`) (`codex/codex-rs/cli/src/main.rs:120-178`).
+- Slash commands include debug-only and "please don't touch this" surfaces: `/debug-m-drop` and `/debug-m-update` render as "DO NOT USE", and `/rollout` + `/test-approval` only appear in debug builds (`codex/codex-rs/tui/src/slash_command.rs:55-196`).
+- Startup tooltips include business logic, time-limited promo copy (for example, "2x rate limits until April 2nd"), and a remote `announcement_tip.toml` fetch from GitHub raw (`codex/codex-rs/tui/src/tooltips.rs:6-209`).
+- `codex app` is macOS-only and will download+mount a DMG and copy `Codex.app` into an Applications directory if missing (`codex/codex-rs/cli/src/main.rs:112-114`, `codex/codex-rs/cli/src/app_cmd.rs:4-20`, `codex/codex-rs/cli/src/desktop_app/mac.rs:1-237`).
+- The `artifact` feature exists in the registry but is deliberately omitted from the user config schema, implying it is not intended as a normal user-toggled flag (`codex/codex-rs/features/src/lib.rs:799-807`, `codex/codex-rs/core/src/config/schema.rs:23-36`).
+- There is a cross-platform "prevent idle sleep while a turn is running" helper, backed by IOKit / `systemd-inhibit` / Win32 power requests (`codex/codex-rs/utils/sleep-inhibitor/src/lib.rs:1-44`, `codex/codex-rs/features/src/lib.rs:828-845`).
+- Realtime voice mode is an audio-only interaction with its own fixed system prompt and explicit UI affordances (`codex/codex-rs/tui/src/chatwidget/realtime.rs:11-233`).
+- The TUI has unusually explicit docs and config plumbing for the alternate-screen vs scrollback conflict in Zellij, including auto-detection via `ZELLIJ*` env vars (`codex/docs/tui-alternate-screen.md:5-113`, `codex/codex-rs/terminal-detection/src/lib.rs:379-383`, `codex/codex-rs/tui/src/lib.rs:1550-1563`).
+- The open-source repo includes the actual model "base instructions" and personality templates in plaintext (for example, `models.json` includes a full Codex agent persona blob) (`codex/codex-rs/core/gpt_5_2_prompt.md:1-80`, `codex/codex-rs/core/models.json:52`).
+- There is even a shipped "orchestrator" agent template that reads like internal operator guidance (including emoji and sub-agent policy), but it is just a prompt template rather than an always-on daemon (`codex/codex-rs/core/templates/agents/orchestrator.md:1-114`).
 
 ## Notable hidden gems
 

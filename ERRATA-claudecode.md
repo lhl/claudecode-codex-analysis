@@ -1,6 +1,6 @@
 # Claude Code ERRATA
 
-This file is intentionally narrower than `ANALYSIS.md`. These are the issues that look most worth reporting or following up on.
+This file is intentionally narrower than the main analysis docs (`ANALYSIS-claudecode.md`, `ANALYSIS-codex.md`). These are the issues that look most worth reporting or following up on.
 
 ## Likely current/reportable issues
 
