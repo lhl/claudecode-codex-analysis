@@ -24,6 +24,45 @@ ERRATA-codex.md          — Codex issues worth reporting (history persistence,
                            compaction cache key, sandbox gaps)
 ```
 
+## Supply chain: how the source leaked
+
+The analysis in this repo exists because Anthropic shipped recoverable source code inside the published `@anthropic-ai/claude-code` npm package (v2.1.88 and earlier). Bun's bundler generates inline sourcemaps with embedded `sourcesContent` by default, and the build pipeline didn't strip them. 552 files with full inline data-URI sourcemaps were present in the published artifact (see [ERRATA-claudecode.md §1](ERRATA-claudecode.md)). An earlier, smaller leak surfaced in early 2025 and was quietly pulled — the same class of issue recurred.
+
+The irony is specific: Claude Code includes an "Undercover Mode" subsystem (`src/utils/undercover.ts`) designed to prevent the AI from leaking internal codenames like "Capybara" in git commits. The build process then shipped the entire source tree in a `.map` file.
+
+### The fix is deterministic
+
+This is not a hard problem. The single highest-leverage change:
+
+**Use `files` (allowlist) in `package.json`, not `.npmignore` (denylist).** With a denylist, every new file type you forget to exclude is a potential leak. With an allowlist, only explicitly listed paths get published.
+
+```json
+{
+  "files": ["dist/index.js", "dist/cli.js", "README.md"]
+}
+```
+
+No `.map`, no `src/`, no `.env`, nothing else gets in. Denylist approaches are the wrong security primitive — you're asking humans (or agents) to enumerate everything that *shouldn't* ship, which is an unbounded set.
+
+The CI gate:
+
+```bash
+# Before npm publish — deterministic, zero false positives
+npm pack --dry-run 2>&1 | grep -E '\.(map|ts|tsx|env)' && exit 1
+```
+
+Or more robustly: unpack the tarball and assert the file list matches an expected manifest. This should be a hard gate, not a lint warning.
+
+### The broader point
+
+The fact that this happened twice — and the second time possibly because an agent was involved in the publish flow — suggests the CI/CD pipeline itself needs to be treated as a security boundary, not just a convenience automation. An agent that can `npm publish` should not inherit ambient authority from the dev environment; the publish step should be a separate capability that requires passing a content validation gate. This is the same capability-boundary problem that shows up in Claude Code's own sandbox design, applied one level up.
+
+The npm ecosystem now supports provenance attestations (SLSA Build L3), which gives a verifiable build-to-publish chain — but provenance doesn't help if the build itself is misconfigured. The real fix is: allowlist-only publishing + deterministic content assertion in CI + treating publish as a privileged operation with its own verification step.
+
+### Timing coincidence
+
+The source leak coincided with a separate supply-chain attack on the `axios` npm package, where malicious versions containing a RAT were published hours before the Claude Code leak surfaced. Anyone who installed Claude Code via npm in that window could have pulled in the compromised axios dependency. These were unrelated incidents, but the temporal overlap illustrates how npm supply-chain risk compounds.
+
 ## Reviewer's note: Claude reading Claude
 
 The Opus 4.6 pass on the Claude Code analysis was done by Claude Opus 4.6 (max), running in Claude Code v2.1.87 — reviewing the source code of the harness it was running inside of, at the time it was running inside of it.
