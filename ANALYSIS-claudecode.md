@@ -14,6 +14,7 @@ So:
 - High confidence: architecture, memory design, compaction logic, telemetry shape, visible feature flags, client-side defensive layers.
 - Medium confidence: exact release mechanism, long-lived assistant internals, internal-only model aliases, internal-only safety systems.
 - Low confidence: anything that would have lived in missing `assistant/*` files or in Anthropic-only config served remotely.
+- For “enumerate everything and cite it” work (skills/flags/config keys/event names), see `CATALOG-claudecode.md`.
 
 ## Executive summary
 
@@ -31,6 +32,7 @@ So:
 - The leaked tree is not just minified bundle output. It contains source-rich transpiled files with inline sourcemaps.
 - Those sourcemaps include `sourcesContent`, which is enough to reconstruct near-original source text.
 - This explains why people could recover readable source even if the package only shipped emitted JS/TSX.
+- Multiple modules are explicitly “stub for external builds”, implying an internal-vs-external overlay system and that this artifact corresponds to a shipped bundle with internal-only code replaced/removed (e.g. `src/moreright/useMoreRight.tsx:1-5`, `src/utils/permissions/bashClassifier.ts:1`).
 
 ### What the artifact does not prove
 
@@ -310,6 +312,18 @@ Some mitigations are direct policy, some are bug workarounds:
 
 These are not generic "AI safety" controls. They are concrete product hardening against observed model failure modes.
 
+### 9. Harbor “channels” + permission relay
+
+There is an entire “send Claude prompts to your phone” surface here, implemented as MCP “channels” plugins and gated at runtime.
+
+Key pieces:
+
+- Channels are globally gateable via GrowthBook (`tengu_harbor`) and allowlisted per-plugin via a GrowthBook “ledger” (`tengu_harbor_ledger`) (`src/services/mcp/channelAllowlist.ts:37-76`).
+- Permission dialogs can be relayed over channels like Telegram/iMessage/Discord, and approvals are *structured* events (`notifications/claude/channel/permission`), not raw-text injection (`src/services/mcp/channelPermissions.ts:1-23`, `src/services/mcp/channelPermissions.ts:169-194`).
+- The 5-letter request IDs are designed for phone usability and have an explicit substring blocklist so they don’t accidentally spell offensive words (`src/services/mcp/channelPermissions.ts:75-110`, `src/services/mcp/channelPermissions.ts:130-152`).
+
+This is notable both as an “always-on agent” affordance and as a security tradeoff: the comments explicitly acknowledge that a compromised channel server could fabricate approvals, and they treat the allowlist as the real trust boundary (`src/services/mcp/channelPermissions.ts:15-23`).
+
 ### What does not appear to exist
 
 - I did not find a strong semantic "mass deletion prevention" layer beyond the permission system, path protections, and model instructions.
@@ -355,6 +369,23 @@ Then inside compaction there are sub-paths:
 - full LLM summarization compaction
 
 This makes the system flexible, but it also creates more stateful edge cases than a single clean compaction mechanism.
+
+### 2.5. What compaction actually does (step-by-step)
+
+If you strip it to mechanics, the query loop does roughly:
+
+1. **Tool-result “content replacement” budget** (prompt-cache stability trick): persist oversized tool results to disk and replace them with stable previews so subsequent turns are byte-identical (`src/query.ts:369-394`, `src/utils/toolResultStorage.ts:740-841`). The resume path treats this as critical cache infrastructure (“cache miss, permanent overage”) (`src/utils/sessionRestore.ts:459-467`).
+2. **Snip** (history surgery): optionally removes chunks of earlier history while emitting a boundary marker; importantly, it plumbs back “tokens freed” because API-usage-based token accounting can’t see the removed prefix (`src/query.ts:396-406`, `src/services/compact/autoCompact.ts:164-168`).
+3. **Microcompact**:
+   - Time-based microcompact can clear old tool result contents via a deterministic replacement string and uses rough token estimates for tool results/images (`src/services/compact/microCompact.ts:32-50`, `src/services/compact/microCompact.ts:137-205`).
+   - Cached microcompact builds `cache_edits` blocks, pins them to a specific user-message index, and re-sends pinned edits at their original positions to preserve cache hits (`src/services/compact/microCompact.ts:52-118`).
+4. **Context collapse** (when enabled) projects and commits a collapsed view before autocompact to avoid replacing granular history with one mega-summary (`src/query.ts:428-447`).
+5. **Autocompact** (full compaction attempt): computes thresholds with a reserved 20k output token budget, and includes a circuit breaker because they observed sessions hammering compaction tens of times (“~250K API calls/day globally”) (`src/services/compact/autoCompact.ts:28-70`, `src/services/compact/autoCompact.ts:257-260`).
+6. **Session-memory compaction** (preferred when available): if a session memory file exists and is non-empty, it uses it as the summary substrate; the “resumed session” path has no true boundary and logs `tengu_sm_compact_resumed_session` (`src/services/compact/sessionMemoryCompact.ts:529-566`).
+7. **Full LLM-summary compaction** (fallback): the prompt is extremely over-specified (it literally asks for “ALL user messages” plus code snippets, errors, pending tasks, etc.) (`src/services/compact/prompt.ts:61-76`). It also contains an “aggressive no-tools preamble” because adaptive-thinking models sometimes try to call tools during compaction (`src/services/compact/prompt.ts:12-23`).
+8. **Post-compact rehydration**: even after producing a summary, it re-injects recently accessed file content, plan files, plan-mode state, invoked skills (truncated), and async-agent status attachments, which can claw back a lot of the saved context (`src/services/compact/compact.ts:1398-1600`).
+
+This is the best client-side explanation for “why compaction feels bad”: the summary prompt is huge *and* the system intentionally re-attaches a lot of state immediately after.
 
 ### 3. Cached microcompact is clever
 
@@ -440,6 +471,15 @@ Two files are particularly revealing:
 The fork-session resume path explicitly reseeds content-replacement records because otherwise tool results become "FROZEN", full content gets resent, and the comments say that leads to cache misses and "permanent overage".
 
 That is a very strong hint that resume correctness is fragile and that the cache system is only stable when transcript reconstruction is byte-faithful.
+
+### 7.5. `--resume` cache misses are plausible by construction
+
+One important tradeoff is visible in the persistence layer:
+
+- For non-`ant` users, Claude Code deliberately does not persist most `attachment` messages to the JSONL transcript, explicitly citing “sensitive info for training” (`src/utils/sessionStorage.ts:4351-4366`).
+- But several cache-stability mechanisms are attachment-based “system reminders” (`deferred_tools_delta`, `agent_listing_delta`, `mcp_instructions_delta`, skill listings, etc.), which are normalized into meta user messages and can affect both message merging and the single per-request `cache_control` marker placement (`src/utils/messages.ts:2269-2290`, `src/utils/messages.ts:4178-4231`, `src/services/api/claude.ts:3062-3106`).
+
+So a resumed session can easily reconstruct a byte-different prompt prefix even when “semantically the same”, forcing a one-turn full `cache_creation` reprocess on resume. The `deferred_tools_delta` system in particular was introduced to avoid per-request ephemeral prepends that bust cache (`src/services/api/claude.ts:1327-1345`, `src/utils/attachments.ts:1455-1475`), but that win depends on those deltas surviving resume.
 
 ### 8. Token counting is multi-layered and fragile
 
@@ -597,6 +637,14 @@ I found no clean "here is the Capybara model" implementation in this artifact, b
 
 So capybara is absolutely a real model codename in the surrounding ecosystem, but this leaked artifact does not expose the actual ant-model configuration payload.
 
+### Harbor / channels
+
+“Harbor” appears to be the MCP “channels” initiative: allowlisted channel plugins (Telegram/iMessage/Discord) plus a structured permission-relay mechanism. See the security section “Harbor channels + permission relay” and the core implementations in `src/services/mcp/channelAllowlist.ts` and `src/services/mcp/channelPermissions.ts`.
+
+### Lodestone (deep links)
+
+“Lodestone” appears to be the deep-link protocol story: the client can auto-register a `claude-cli://` protocol handler, gated by `tengu_lodestone_enabled` (`src/utils/deepLink/registerProtocol.ts:292-347`).
+
 ### Mythos
 
 I found no direct `mythos` references in this artifact.
@@ -610,6 +658,51 @@ The strongest lessons for an always-on agent framework are:
 - aggressively keep long-running shell work off the foreground agent path
 - preserve cache-safe prompt state across background helpers
 - keep durable memory extraction tool-constrained and coalesced
+
+## Quirks, Easter Eggs, and fun/weird bits
+
+These aren’t the “main architecture”, but they’re the kind of glue that reveals how the product actually behaves.
+
+### Buddy system (`/buddy`)
+
+- It’s a build-time feature-gated gacha-style “companion” that sits beside the input and sometimes reacts; it’s also explicitly designed to be “viral” (local-date teaser window for a rolling timezone wave, “sustained Twitter buzz”, and “gentler on soul-gen load”) (`src/buddy/useBuddyNotification.tsx:9-21`).
+- The teaser window is April 1-7, 2026 (local date), but the feature stays live after (`src/buddy/useBuddyNotification.tsx:9-21`).
+- Companion “bones” are deterministic per user: a seeded PRNG (`mulberry32`) and a stable salt `friend-2026-401` over a user ID hash; the result is memoized because it’s called from hot paths (sprite tick, per-keystroke PromptInput, per-turn observer) (`src/buddy/companion.ts:15-112`).
+- Rarity is weighted (`common: 60 ... legendary: 1`), there’s a `shiny` 1% roll, and stats include `DEBUGGING`, `PATIENCE`, `CHAOS`, `WISDOM`, `SNARK` (`src/buddy/types.ts:1-107`, `src/buddy/companion.ts:43-101`).
+- “Soul” (name/personality) is model-generated and stored in config, while “bones” are regenerated on every read so config edits can’t “cheat” a legendary and future species list edits don’t brick old companions (`src/buddy/types.ts:100-128`, `src/buddy/companion.ts:124-133`, `src/utils/config.ts:269-271`).
+- They treat internal model codenames as a leak hazard: buddy species are runtime-constructed with `String.fromCharCode`, with an explicit comment about a “model-codename canary” and avoiding literal strings in external bundles (notably `capybara`) (`src/buddy/types.ts:10-38`).
+- The model is told “you’re not the companion” via a dedicated `companion_intro` `<system-reminder>` attachment, and is instructed to keep its own response to one line when the user is addressing the buddy directly (`src/buddy/prompt.ts:7-36`, `src/utils/messages.ts:4232-4239`).
+- The core buddy command and “friend observer” aren’t present in this leaked tree (required as `./commands/buddy/index.js`, referenced as `src/buddy/observer.ts`), so we can’t see how the first “hatch” (soul generation) or reactions are actually implemented (`src/commands.ts:118-122`, `src/state/AppStateStore.ts:168-171`).
+
+### Anti-distillation decoy-tool injection
+
+- The client has a first-class “anti-distillation” wire knob: when enabled, it sends `anti_distillation: ['fake_tools']` in API request bodies (`src/services/api/claude.ts:301-313`).
+- It is deliberately limited to first-party CLI traffic: it’s gated behind a build feature (`ANTI_DISTILLATION_CC`), `CLAUDE_CODE_ENTRYPOINT === 'cli'`, “first party only” betas, and a GrowthBook feature value (`tengu_anti_distill_fake_tool_injection`) (`src/services/api/claude.ts:301-313`).
+- The client artifact does not show the server behavior (e.g., how decoy tools get spliced into the system prompt), only the opt-in signal.
+
+### Voice mode “Cloudflare TLS fingerprinting” hack
+
+- `voice_stream` websocket traffic is routed to `api.anthropic.com` instead of `claude.ai` because Cloudflare TLS fingerprinting on the `claude.ai` zone challenges non-browser clients; desktop dictation can still hit `claude.ai` because Swift URLSession has a “browser-class JA3 fingerprint” (`src/services/voiceStreamSTT.ts:124-131`).
+- There is also an explicit STT-provider ramp knob: `tengu_cobalt_frost` switches the backend to “conversation-engine with Deepgram Nova 3”, bypassing the server’s own GrowthBook gate so clients can be ramped independently (`src/services/voiceStreamSTT.ts:153-165`).
+
+### Misc “product glue” signals
+
+- Output styles as product-level behavior programming: built-in `Explanatory` and `Learning` styles ship as huge prompt blocks. “Learning” explicitly instructs the model to insert a single `TODO(human)` section into the codebase before asking the user to write 2–10 lines of code (`src/constants/outputStyles.ts:56-93`).
+- TodoWriteTool has a built-in “spawn a verifier” nudge: if you close a 3+ item todo list with no “verif*” task, the tool result tells the assistant to spawn the verification agent and says “You cannot self-assign PARTIAL … only the verifier issues a verdict.” (`src/tools/TodoWriteTool/TodoWriteTool.ts:72-108`).
+- Harbor permission IDs avoid accidental profanity: the 5-letter approval IDs have an explicit substring blocklist (and a funny comment about why they avoided numbers) (`src/services/mcp/channelPermissions.ts:80-109`).
+- “Miraculo the bard” is a killswitch: `tengu_miraculo_the_bard` disables the startup fast-mode prefetch network call but preserves org-policy enforcement by resolving from cache (`src/main.tsx:2344-2365`).
+- The “attribution header” is literally a fake HTTP header line embedded as a system-prompt text block (`x-anthropic-billing-header: ...`). When native client attestation is enabled it includes `cch=00000`, and the comment says Bun’s HTTP stack rewrites the placeholder in the serialized request bytes, pointing at a Zig implementation (`src/constants/system.ts:59-72`, `src/utils/sideQuery.ts:146-167`).
+- One of the built-in “spinner verbs” is literally `Tomfoolering` (`src/constants/spinnerVerbs.ts:183`).
+- There’s unusually candid in-code doubt: an `ollie` TODO above a memoized MCP connect helper says the memoization “increases complexity by a lot” and they’re “not sure it really improves performance” (`src/services/mcp/client.ts:588-607`).
+- They have an explicit guard to prevent config writes from wiping auth state if the config file is truncated/corrupted mid-write, and it references a real GitHub issue (#3117) (`src/utils/config.ts:776-865`).
+- The external build ships 18 hard-disabled hidden command stubs of the form `export default { isEnabled: () => false, isHidden: true, name: 'stub' };` — likely placeholders for internal-only commands: `ant-trace`, `autofix-pr`, `backfill-sessions`, `break-cache`, `bughunter`, `ctx_viz`, `debug-tool-call`, `env`, `good-claude`, `issue`, `mock-limits`, `oauth-refresh`, `onboarding`, `perf-issue`, `reset-limits`, `share`, `summary`, `teleport` (`src/commands/ant-trace/index.js:1`, `src/commands/autofix-pr/index.js:1`, `src/commands/backfill-sessions/index.js:1`, `src/commands/break-cache/index.js:1`, `src/commands/bughunter/index.js:1`, `src/commands/ctx_viz/index.js:1`, `src/commands/debug-tool-call/index.js:1`, `src/commands/env/index.js:1`, `src/commands/good-claude/index.js:1`, `src/commands/issue/index.js:1`, `src/commands/mock-limits/index.js:1`, `src/commands/oauth-refresh/index.js:1`, `src/commands/onboarding/index.js:1`, `src/commands/perf-issue/index.js:1`, `src/commands/reset-limits/index.js:1`, `src/commands/share/index.js:1`, `src/commands/summary/index.js:1`, `src/commands/teleport/index.js:1`).
+
+### Community reverse-engineering threads (useful cross-checks)
+
+- https://www.reddit.com/r/ClaudeAI/comments/1s8lkkm/i_dug_through_claude_codes_leaked_source_and/
+- https://www.reddit.com/r/claude/comments/1s7yjk0/this_guy_nails_it_i_cant_thank_him_enough_psa/
+
+I could not review the linked X/Twitter threads from this environment, but the two reddit writeups above line up with multiple concrete code-level artifacts (buddy system, voice_stream CF/TLS routing, attestation placeholder mechanics, and resume/cache fragility).
 
 ## Bundled skills visible in this artifact
 
@@ -638,27 +731,18 @@ Feature-gated skills are referenced but not present in this tree, including at l
 - `hunter`
 - `runSkillGenerator`
 
-## Build-time feature flags found in this artifact
+## Feature flags / runtime config / analytics event names (exhaustive)
 
-Extracted mechanically from `feature('...')` calls across `src/`.
+For an exhaustive, cited list of:
 
-`ABLATION_BASELINE`, `AGENT_MEMORY_SNAPSHOT`, `AGENT_TRIGGERS`, `AGENT_TRIGGERS_REMOTE`, `ALLOW_TEST_VERSIONS`, `ANTI_DISTILLATION_CC`, `AUTO_THEME`, `AWAY_SUMMARY`, `BASH_CLASSIFIER`, `BG_SESSIONS`, `BREAK_CACHE_COMMAND`, `BRIDGE_MODE`, `BUDDY`, `BUILDING_CLAUDE_APPS`, `BUILTIN_EXPLORE_PLAN_AGENTS`, `BYOC_ENVIRONMENT_RUNNER`, `CACHED_MICROCOMPACT`, `CCR_AUTO_CONNECT`, `CCR_MIRROR`, `CCR_REMOTE_SETUP`, `CHICAGO_MCP`, `COMMIT_ATTRIBUTION`, `COMPACTION_REMINDERS`, `CONNECTOR_TEXT`, `CONTEXT_COLLAPSE`, `COORDINATOR_MODE`, `COWORKER_TYPE_TELEMETRY`, `DAEMON`, `DIRECT_CONNECT`, `DOWNLOAD_USER_SETTINGS`, `DUMP_SYSTEM_PROMPT`, `ENHANCED_TELEMETRY_BETA`, `EXPERIMENTAL_SKILL_SEARCH`, `EXTRACT_MEMORIES`, `FILE_PERSISTENCE`, `FORK_SUBAGENT`, `HARD_FAIL`, `HISTORY_PICKER`, `HISTORY_SNIP`, `HOOK_PROMPTS`, `IS_LIBC_GLIBC`, `IS_LIBC_MUSL`, `KAIROS`, `KAIROS_BRIEF`, `KAIROS_CHANNELS`, `KAIROS_DREAM`, `KAIROS_GITHUB_WEBHOOKS`, `KAIROS_PUSH_NOTIFICATION`, `LODESTONE`, `MCP_RICH_OUTPUT`, `MCP_SKILLS`, `MEMORY_SHAPE_TELEMETRY`, `MESSAGE_ACTIONS`, `MONITOR_TOOL`, `NATIVE_CLIENT_ATTESTATION`, `NATIVE_CLIPBOARD_IMAGE`, `NEW_INIT`, `OVERFLOW_TEST_TOOL`, `PERFETTO_TRACING`, `POWERSHELL_AUTO_MODE`, `PROACTIVE`, `PROMPT_CACHE_BREAK_DETECTION`, `QUICK_SEARCH`, `REACTIVE_COMPACT`, `REVIEW_ARTIFACT`, `RUN_SKILL_GENERATOR`, `SELF_HOSTED_RUNNER`, `SHOT_STATS`, `SKILL_IMPROVEMENT`, `SLOW_OPERATION_LOGGING`, `SSH_REMOTE`, `STREAMLINED_OUTPUT`, `TEAMMEM`, `TEMPLATES`, `TERMINAL_PANEL`, `TOKEN_BUDGET`, `TORCH`, `TRANSCRIPT_CLASSIFIER`, `TREE_SITTER_BASH`, `TREE_SITTER_BASH_SHADOW`, `UDS_INBOX`, `ULTRAPLAN`, `ULTRATHINK`, `UNATTENDED_RETRY`, `UPLOAD_USER_SETTINGS`, `VERIFICATION_AGENT`, `VOICE_MODE`, `WEB_BROWSER_TOOL`, `WORKFLOW_SCRIPTS`.
+- bundled skill names (`registerBundledSkill`)
+- build-time feature flags (`feature('...')`)
+- GrowthBook feature keys (`getFeatureValue_*('...')`)
+- Statsig gates (`checkStatsigFeatureGate_*('...')`)
+- dynamic config keys (`getDynamicConfig_*('...')`)
+- analytics event names (`logEvent('...')`)
 
-## Runtime flags/config keys found in this artifact
-
-Extracted mechanically from `getFeatureValue_*`, `checkStatsigFeatureGate_*`, and `getDynamicConfig_*` calls across `src/`.
-
-### GrowthBook / feature values
-
-`enhanced_telemetry_beta`, `tengu_agent_list_attach`, `tengu_amber_flint`, `tengu_amber_json_tools`, `tengu_amber_prism`, `tengu_amber_quartz_disabled`, `tengu_amber_stoat`, `tengu_anti_distill_fake_tool_injection`, `tengu_attribution_header`, `tengu_auto_background_agents`, `tengu_auto_mode_config`, `tengu_basalt_3kr`, `tengu_birch_trellis`, `tengu_bramble_lintel`, `tengu_bridge_initial_history_cap`, `tengu_bridge_repl_v2`, `tengu_bridge_repl_v2_cse_shim_enabled`, `tengu_bridge_system_init`, `tengu_ccr_bridge`, `tengu_ccr_mirror`, `tengu_chomp_inflection`, `tengu_chrome_auto_enable`, `tengu_cicada_nap_ms`, `tengu_cobalt_frost`, `tengu_cobalt_harbor`, `tengu_cobalt_lantern`, `tengu_cobalt_raccoon`, `tengu_collage_kaleidoscope`, `tengu_compact_cache_prefix`, `tengu_compact_line_prefix_killswitch`, `tengu_compact_streaming_retry`, `tengu_copper_bridge`, `tengu_copper_panda`, `tengu_coral_fern`, `tengu_cork_m4q`, `tengu_destructive_command_warning`, `tengu_disable_keepalive_on_econnreset`, `tengu_disable_streaming_to_non_streaming_fallback`, `tengu_enable_settings_sync_push`, `tengu_fgts`, `tengu_glacier_2xr`, `tengu_grey_step2`, `tengu_harbor`, `tengu_harbor_permissions`, `tengu_hawthorn_steeple`, `tengu_herring_clock`, `tengu_hive_evidence`, `tengu_immediate_model_command`, `tengu_iron_gate_closed`, `tengu_kairos_brief`, `tengu_kairos_cron`, `tengu_kairos_cron_durable`, `tengu_keybinding_customization_release`, `tengu_lapis_finch`, `tengu_lodestone_enabled`, `tengu_marble_fox`, `tengu_marble_sandcastle`, `tengu_miraculo_the_bard`, `tengu_moth_copse`, `tengu_otk_slot_v1`, `tengu_paper_halyard`, `tengu_passport_quail`, `tengu_pebble_leaf_prune`, `tengu_penguins_off`, `tengu_pid_based_version_locking`, `tengu_plan_mode_interview_phase`, `tengu_plugin_official_mkt_git_fallback`, `tengu_plum_vx3`, `tengu_quartz_lantern`, `tengu_quiet_fern`, `tengu_read_dedup_killswitch`, `tengu_remote_backend`, `tengu_sedge_lantern`, `tengu_session_memory`, `tengu_slate_prism`, `tengu_slate_thimble`, `tengu_slim_subagent_claudemd`, `tengu_sm_compact`, `tengu_strap_foyer`, `tengu_surreal_dali`, `tengu_terminal_panel`, `tengu_terminal_sidebar`, `tengu_trace_lantern`, `tengu_turtle_carbon`, `tengu_ultraplan_model`, `tengu_vscode_cc_auth`, `tengu_willow_mode`.
-
-### Statsig gates
-
-`tengu_chair_sermon`, `tengu_disable_bypass_permissions_mode`, `tengu_scratch`, `tengu_streaming_tool_execution2`, `tengu_thinkback`, `tengu_tool_pear`, `tengu_toolref_defer_j8m`, `tengu_vscode_onboarding`, `tengu_vscode_review_upsell`.
-
-### Dynamic config keys
-
-`tengu-off-switch`, `tengu_auto_mode_config`, `tengu_bridge_min_version`, `tengu_desktop_upsell`, `tengu_max_version_config`, `tengu_version_config`.
+…see `CATALOG-claudecode.md`.
 
 ## What I would steal for our own system
 
@@ -683,4 +767,3 @@ Extracted mechanically from `getFeatureValue_*`, `checkStatsigFeatureGate_*`, an
 - What are the full internal `tengu_ant_model_override` payloads and hidden model aliases?
 - What is the actual npm publication path that leaked the inline sourcemaps?
 - How much of the cache/resume pain is client-side versus server-side prompt-caching behavior?
-

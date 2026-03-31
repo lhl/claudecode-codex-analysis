@@ -7,10 +7,15 @@ Initial analysis was performed with GPT-5.4 xhigh in Codex for both codebases. S
 ## Files
 
 ```
+ANALYSIS.md              — Entry point (links to both analyses)
 ANALYSIS-claudecode.md   — Full Claude Code source analysis (architecture, memory,
                            compaction, telemetry, hidden features, etc.)
 ANALYSIS-codex.md        — Full Codex source analysis (Rust core, sandboxing,
                            memory pipeline, plugins/skills/MCP, etc.)
+CATALOG-claudecode.md    — Mechanically extracted index of Claude Code bundled skills,
+                           build/runtime flags, config keys, and analytics event names
+                           with file:line references
+ERRATA.md                — Entry point (links to both errata files)
 ERRATA-claudecode.md     — Claude Code issues worth reporting (sourcemaps,
                            compaction bugs, security gaps)
 ERRATA-codex.md          — Codex issues worth reporting (history persistence,

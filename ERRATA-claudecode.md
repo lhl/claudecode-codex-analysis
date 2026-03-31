@@ -126,6 +126,41 @@ What to report:
 - The cache-resume contract should be made more explicit and more robust.
 - Cache correctness should not hinge on replaying replacement decisions from sidecar records with such high precision.
 
+### 7. External transcript persistence drops attachment-based deltas, likely breaking cache on resume
+
+Severity: high cost/performance issue for `--resume`, medium correctness
+
+Evidence:
+
+- For non-`ant` users, Claude Code deliberately does not persist most `attachment` messages in transcripts (`isLoggableMessage` returns false), citing “sensitive info for training” (`src/utils/sessionStorage.ts:4351-4366`).
+- Several cache-stability signals are attachment-based “system reminders” (`deferred_tools_delta`, `agent_listing_delta`, `mcp_instructions_delta`, etc.). They become meta user messages in API normalization and can affect both message merging and the single per-request `cache_control` marker placement (`src/utils/messages.ts:2269-2290`, `src/utils/messages.ts:4178-4231`, `src/services/api/claude.ts:3062-3106`).
+- The deferred-tools delta system exists specifically to replace earlier “ephemeral prepends” that busted cache, so it is inherently part of the cache contract (`src/services/api/claude.ts:1327-1345`, `src/utils/attachments.ts:1455-1475`).
+
+Why it matters:
+
+- If attachment-derived prompt prefix state is included in cached API requests but not written to disk, `--resume` cannot reconstruct a byte-identical prefix and will force a full cache miss (one-turn `cache_creation` reprocess) on resume.
+
+What to report:
+
+- Persist enough cache-critical attachment state (even redacted/hashes) to reproduce the cached prefix on resume, or ensure these deltas are injected in a way that is stable across sessions.
+
+### 8. Native client attestation rewrites `cch=00000` in request bytes
+
+Severity: medium (could be high if the replacement is brittle)
+
+Evidence:
+
+- The “attribution header” is embedded as a system-prompt text block, and when `NATIVE_CLIENT_ATTESTATION` is enabled it includes a `cch=00000` placeholder; comments state Bun’s native HTTP stack overwrites the zeros in the serialized request body with a computed hash, pointing to a Zig implementation (`src/constants/system.ts:59-72`, `src/constants/system.ts:81-91`).
+
+Why it matters:
+
+- Post-serialization rewriting is a potential source of byte-level nondeterminism that can break prompt-cache hits and make debugging resume/cache behavior harder.
+- If the replacement algorithm is not strict about matching only the intended placeholder, user/system content that includes the sentinel could be mutated.
+
+What to report:
+
+- Confirm the replacement is an exact, unambiguous match and is robust to user/system text containing the sentinel elsewhere.
+
 ## Historical/likely-fixed issues documented in comments
 
 These may already be fixed, but they are worth knowing because they show where the system has broken before.
@@ -157,4 +192,3 @@ This is important for analysis, but it is not necessarily a Claude Code product 
 ### No direct Mythos hits
 
 I found no `mythos` strings in this tree. That absence should not be overinterpreted because the artifact is incomplete and appears closer to an external build than an internal ant build.
-
