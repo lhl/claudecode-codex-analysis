@@ -134,6 +134,52 @@ Why it matters:
 
 - This is user-initiated, but it is still a supply-chain surface: there is no hash/signature verification in the client itself (beyond whatever macOS enforces when launching).
 
+## 12. Pre-turn compaction doesn't account for pending context updates
+
+Pre-turn compaction fires before context updates are recorded, so it doesn't estimate pending context diffs, reinjection overhead, or new user input.
+
+- TODO and surrounding logic: `codex/codex-rs/core/src/codex.rs:5668-5671`
+- Post-sampling compaction at line 5979 compensates reactively
+
+Why it matters:
+
+- Sessions can overshoot the context window between pre-turn and post-sampling checks.
+- The workaround (reactive mid-turn compaction) works but adds latency.
+
+## 13. Image token estimation cached by URL hash, not image content
+
+Image token estimates are cached using `SHA1(url)` as the key, not a hash of the image data.
+
+- LRU cache: `codex/codex-rs/core/src/context_manager/history.rs:510-512`
+- Decode failure fallback: `codex/codex-rs/core/src/context_manager/history.rs:587-604`
+
+Why it matters:
+
+- If the image at a URL changes (common for generated images, dashboards, screenshots), the cached estimate is stale.
+- On decode failure, silently falls back to `RESIZED_IMAGE_BYTES_ESTIMATE` (7,373 bytes / ~1,844 tokens) regardless of actual size.
+
+## 14. Settings update diffs don't cover all model-visible context items
+
+A TODO notes that fork/resume cannot deterministically diff everything in `build_initial_context`.
+
+- TODO: `codex/codex-rs/core/src/context_manager/updates.rs:196-199`
+
+Why it matters:
+
+- Some context changes may not be properly tracked across fork or session resumption.
+- Falls back to full reinjection when `reference_context_item` is cleared during rollback of mixed context bundles.
+
+## 15. WebSocket-to-HTTP fallback is session-scoped with no recovery
+
+Once a WebSocket timeout or error triggers the HTTP fallback, all future turns in the session use HTTP. There is no mechanism to retry WebSocket.
+
+- Fallback logic: `codex/codex-rs/core/src/client.rs:320-339`
+
+Why it matters:
+
+- A single transient network issue (DNS hiccup, proxy timeout) permanently degrades the session to HTTP for the remainder.
+- HTTP lacks the incremental-delta optimization that WebSocket enables.
+
 ## Summary
 
 The public Codex repo is much cleaner than the Claude Code leak, but the rough edges cluster in predictable places:
