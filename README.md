@@ -120,3 +120,23 @@ Claude Code could use Codex's typed state-machine approach, clean compaction del
 ### Overall
 
 These are recognizably the same kind of system — LLM-powered coding agents with shell access, sandboxing, memory, and compaction — built by teams that made very different tradeoffs. Codex optimized for architectural clarity from a clean start in Rust. Claude Code optimized for shipping features fast in TypeScript and fixing what broke. The interesting question is convergence: does Codex accumulate the same complexity under production load, or does the Rust type system provide enough structural resistance to keep the architecture clean as the feature set grows? Two years from now either answer would be interesting.
+
+## Other analysis
+
+A useful complementary external writeup:
+
+- [Paweł Józefiak, "Claude Code’s Source Got Leaked. Here’s What’s Actually Worth Learning."](https://thoughts.jock.pl/p/claude-code-source-leak-what-to-learn-ai-agents-2026) (2026-04-01)
+
+Useful details from that writeup that were not called out explicitly in our own analysis docs:
+
+- File-read dedup: before re-reading a file, reuse cached content if the file has not changed.
+- `CLAUDE.md` reinsertion on turn changes, not just startup prompt assembly.
+- "Skeptical memory": treat memory as a hint and verify against the live codebase before acting on it.
+
+## Benchmark context
+
+If you care about the harness itself, not just the leaked architecture, check the official Terminal-Bench pages directly rather than relying on social-media summaries or stale screenshots. Leaderboard positions move over time.
+
+- [Terminal-Bench 2.0 official leaderboard](https://www.tbench.ai/leaderboard/terminal-bench/2.0): as of 2026-04-01, `Claude Code / Claude Opus 4.6` is rank 39/122 at 58.0%, which matches the external article's "39th" claim.
+- [Terminal-Bench 1.0 leaderboard](https://www.tbench.ai/leaderboard/terminal-bench/1.0): `Claude Code / claude-opus-4` is rank 20/62 at 43.2%.
+- [Cursor, "Introducing Composer 2"](https://cursor.com/blog/composer-2) (2026-03-19): explicitly notes that Anthropic model scores use the Claude Code harness, OpenAI model scores use the Simple Codex harness, and Cursor computed its score with the official Harbor evaluation framework under default Terminal-Bench 2.0 settings.
